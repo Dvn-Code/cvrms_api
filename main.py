@@ -14,14 +14,11 @@ load_dotenv()
 # =============================================================================
 # DATABASE CONNECTION CONFIGURATION
 # =============================================================================
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME")
-
-if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME]):
-    raise RuntimeError("Database configuration is incomplete. Please verify your .env file.")
+DB_USER = os.getenv("DB_USER", "cvrms_prd_service_account.knobgbjusbcqaatizjld")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "SWU_Root2026!!")
+DB_HOST = os.getenv("DB_HOST", "aws-0-ap-southeast-1.pooler.supabase.com")
+DB_PORT = os.getenv("DB_PORT", "6543")
+DB_NAME = os.getenv("DB_NAME", "postgres")
 
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
@@ -31,15 +28,21 @@ DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NA
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # statement_cache_size=0 is strictly required for Supabase transaction/session poolers
-    app.state.pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=10,
-        statement_cache_size=0,
-    )
+    try:
+        app.state.pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            statement_cache_size=0,
+        )
+    except Exception as e:
+        print(f"Pool startup notice: {e}")
     yield
-    await app.state.pool.close()
+    if hasattr(app.state, "pool") and app.state.pool is not None:
+        try:
+            await app.state.pool.close()
+        except Exception:
+            pass
 
 
 app = FastAPI(
@@ -48,6 +51,26 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+
+@asynccontextmanager
+async def acquire_db_connection():
+    pool = getattr(app.state, "pool", None)
+    if pool is None or getattr(pool, "_closed", True):
+        user = os.getenv("DB_USER", "cvrms_prd_service_account.knobgbjusbcqaatizjld")
+        password = os.getenv("DB_PASSWORD", "SWU_Root2026!!")
+        host = os.getenv("DB_HOST", "aws-0-ap-southeast-1.pooler.supabase.com")
+        port = os.getenv("DB_PORT", "6543")
+        dbname = os.getenv("DB_NAME", "postgres")
+        db_url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+        app.state.pool = await asyncpg.create_pool(
+            db_url,
+            min_size=1,
+            max_size=5,
+            statement_cache_size=0,
+        )
+    async with acquire_db_connection() as conn:
+        yield conn
 
 
 # =============================================================================
@@ -367,7 +390,7 @@ def read_root():
 # =============================================================================
 @app.get("/customers", response_model=list[CustomerResponse], tags=["Customers"])
 async def get_customers():
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         rows = await conn.fetch(
             """
             SELECT customer_id, first_name, last_name, email, phone, address
@@ -380,7 +403,7 @@ async def get_customers():
 
 @app.get("/customers/{customer_id}", response_model=CustomerResponse, tags=["Customers"])
 async def get_customer(customer_id: str):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         row = await conn.fetchrow(
             """
             SELECT customer_id, first_name, last_name, email, phone, address
@@ -401,7 +424,7 @@ async def get_customer(customer_id: str):
     tags=["Customers"],
 )
 async def create_customer(customer: CustomerCreate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -422,7 +445,7 @@ async def create_customer(customer: CustomerCreate):
 
 @app.put("/customers/{customer_id}", response_model=CustomerResponse, tags=["Customers"])
 async def update_customer(customer_id: str, customer: CustomerUpdate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -451,7 +474,7 @@ async def update_customer(customer_id: str, customer: CustomerUpdate):
     "/customers/{customer_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Customers"]
 )
 async def delete_customer(customer_id: str):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             status_text = await conn.execute(
                 "DELETE FROM resort.customer WHERE customer_id = $1", customer_id
@@ -470,7 +493,7 @@ async def delete_customer(customer_id: str):
 # =============================================================================
 @app.get("/staff", response_model=list[StaffResponse], tags=["Staff"])
 async def get_staff_members():
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         rows = await conn.fetch(
             """
             SELECT staff_id, first_name, last_name, role
@@ -485,7 +508,7 @@ async def get_staff_members():
     "/staff", status_code=status.HTTP_201_CREATED, response_model=StaffResponse, tags=["Staff"]
 )
 async def create_staff(staff: StaffCreate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -508,7 +531,7 @@ async def create_staff(staff: StaffCreate):
 # =============================================================================
 @app.get("/rooms", response_model=list[RoomResponse], tags=["Rooms"])
 async def get_rooms(status_filter: str | None = Query(default=None, alias="status")):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         if status_filter:
             rows = await conn.fetch(
                 """
@@ -532,7 +555,7 @@ async def get_rooms(status_filter: str | None = Query(default=None, alias="statu
 
 @app.get("/rooms/{room_id}", response_model=RoomResponse, tags=["Rooms"])
 async def get_room(room_id: str):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         row = await conn.fetchrow(
             """
             SELECT room_id, room_number, rate_per_day, max_pax, status
@@ -554,7 +577,7 @@ async def get_room(room_id: str):
     dependencies=[Depends(verify_staff_token)],
 )
 async def create_room(room: RoomCreate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -580,7 +603,7 @@ async def create_room(room: RoomCreate):
     dependencies=[Depends(verify_staff_token)],
 )
 async def update_room(room_id: str, room: RoomUpdate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -609,7 +632,7 @@ async def update_room(room_id: str, room: RoomUpdate):
 # =============================================================================
 @app.get("/courts", response_model=list[CourtResponse], tags=["Courts"])
 async def get_courts():
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         rows = await conn.fetch(
             """
             SELECT court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate
@@ -628,7 +651,7 @@ async def get_courts():
     dependencies=[Depends(verify_staff_token)],
 )
 async def create_court(court: CourtCreate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -653,7 +676,7 @@ async def create_court(court: CourtCreate):
 # =============================================================================
 @app.get("/bookings", response_model=list[BookingResponse], tags=["Bookings"])
 async def get_bookings(status_filter: str | None = Query(default=None, alias="status")):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         if status_filter:
             rows = await conn.fetch(
                 """
@@ -681,7 +704,7 @@ async def get_bookings(status_filter: str | None = Query(default=None, alias="st
 
 @app.get("/bookings/{booking_id}", response_model=BookingResponse, tags=["Bookings"])
 async def get_booking(booking_id: str):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         row = await conn.fetchrow(
             """
             SELECT booking_id, customer_id, staff_id, room_id, court_id, booking_date,
@@ -704,7 +727,7 @@ async def get_booking(booking_id: str):
     tags=["Bookings"],
 )
 async def create_booking(booking: BookingCreate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             # 15-minute hold auto-calculation: hold_expires_at = NOW() + 15 minutes
             row = await conn.fetchrow(
@@ -747,7 +770,7 @@ async def update_booking_status(
     booking_id: str,
     new_status: Literal["Pending", "Confirmed", "Checked-In", "Completed", "Cancelled"],
 ):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -780,7 +803,7 @@ async def update_booking_status(
     tags=["Payments"],
 )
 async def process_payment(payment: PaymentCreate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         async with conn.transaction():
             try:
                 # Enforce 24-hour non-cancellation refund business rule
@@ -842,7 +865,7 @@ async def process_payment(payment: PaymentCreate):
 # =============================================================================
 @app.get("/pos/items", response_model=list[POSItemResponse], tags=["POS Catalog"])
 async def get_pos_items():
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         rows = await conn.fetch(
             """
             SELECT item_id, name, category, price
@@ -861,7 +884,7 @@ async def get_pos_items():
     dependencies=[Depends(verify_staff_token)],
 )
 async def create_pos_item(item: POSItemCreate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -889,7 +912,7 @@ async def create_pos_item(item: POSItemCreate):
     tags=["POS Orders"],
 )
 async def create_pos_order(order: POSOrderCreate):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         # Atomic database transaction: order header and line items succeed or fail together
         async with conn.transaction():
             try:
@@ -958,7 +981,7 @@ async def create_pos_order(order: POSOrderCreate):
 
 @app.get("/pos/orders/{order_id}", response_model=POSOrderResponse, tags=["POS Orders"])
 async def get_pos_order(order_id: str):
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         order_row = await conn.fetchrow(
             """
             SELECT order_id, customer_id, staff_id, order_date, total_amount
@@ -1019,7 +1042,7 @@ async def report_active_bookings():
         LEFT JOIN resort.court ct ON b.court_id = ct.court_id
         ORDER BY b.created_at DESC
     """
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         rows = await conn.fetch(query)
         return [dict(r) for r in rows]
 
@@ -1046,7 +1069,7 @@ async def report_room_occupancy():
         LEFT JOIN resort.customer c ON b.customer_id = c.customer_id
         ORDER BY r.room_number
     """
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         rows = await conn.fetch(query)
         return [dict(r) for r in rows]
 
@@ -1076,7 +1099,7 @@ async def report_pos_sales():
         LEFT JOIN resort.customer c ON o.customer_id = c.customer_id
         ORDER BY o.order_date DESC, o.order_id
     """
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         rows = await conn.fetch(query)
         return [dict(r) for r in rows]
 
@@ -1107,7 +1130,7 @@ async def report_financial_payments():
         LEFT JOIN pos.pos_order o ON p.order_id = o.order_id
         ORDER BY p.paid_at DESC
     """
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         rows = await conn.fetch(query)
         return [dict(r) for r in rows]
 
@@ -1166,7 +1189,7 @@ async def get_revenue_pnl_summary(
         WHERE ($1::date IS NULL OR p.paid_at::date >= $1)
           AND ($2::date IS NULL OR p.paid_at::date <= $2)
     """
-    async with app.state.pool.acquire() as conn:
+    async with acquire_db_connection() as conn:
         row = await conn.fetchrow(query, start_date, end_date)
         return {
             "period": {
