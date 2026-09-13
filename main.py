@@ -74,7 +74,7 @@ async def acquire_db_connection():
             max_size=5,
             statement_cache_size=0,
         )
-    async with acquire_db_connection() as conn:
+    async with app.state.pool.acquire() as conn:
         yield conn
 
 
