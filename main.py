@@ -7,7 +7,12 @@ from typing import Literal
 import asyncpg
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+try:
+    from pydantic import EmailStr
+except Exception:
+    EmailStr = str
 
 load_dotenv()
 
