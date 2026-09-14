@@ -16,6 +16,22 @@ except Exception:
 
 load_dotenv()
 
+#This is the main.py (FastAPI) for CVRMS (Casa Vista Resort Management System) API, which serves as the backend for managing resort accommodations, sports amenities, cashless payments, and POS retail modules. It includes database connection configuration, application lifespan management, Pydantic schemas for data validation, and CRUD operations for customers, staff, rooms, courts, bookings, payments, and POS items.
+#Members: Abarquez, Divinangelo; Astrologo, Russell John; Cabilao, John Michael
+#We intended to use FastAPI plus Supabase instead of local PHP since the client is serious in deploying this project and we have learned so much during our ITE 298 course.
+#With that, this code already included github license (Apache 2.0) and we will be using this code for our final project in ITE 298.
+#We also added a vercel.json and requirements.txt for free online hosting of the FastAPI.
+#We have successfully deployed this project on Vercel and the link is https://cvrms-api.vercel.app/docs 
+#We also successfully tried to register a customer in our Android Application, and thankfuly it worked after how many days of debugging.
+#Plus, we also successfully connected a user to Supabase's auth.users with encrypted password.
+#We also finished including Google Log-in Authentication for our Android App still incorporating Supabase with this FastAPI. 
+#The limitations, however, for this P2 submission is that we haven't tried to actualy book a room yet. We still focused on registering an account (customer), not yet admin too.
+#There's also no POS yet. Hehehe we don't know how to yet.
+#Any feedbacks, suggestions, and comments are welcome. Thank you for your time and consideration sir.
+#Note: We acknowledge that we used AI for this project but we also made sure to understand atleast the logic and flow of the code.
+#- we also watched a lot of youtube videos and read some articles to understand the code and how to implement it in our Android Application.
+#Thank you so much!
+
 # =============================================================================
 # DATABASE CONNECTION CONFIGURATION
 # =============================================================================
@@ -734,6 +750,51 @@ async def get_booking(booking_id: str):
 async def create_booking(booking: BookingCreate):
     async with acquire_db_connection() as conn:
         try:
+            # 1. Ensure staff_id exists in resort.staff table
+            await conn.execute(
+                """
+                INSERT INTO resort.staff (staff_id, first_name, last_name, role)
+                VALUES ($1, 'System', 'Staff', 'Receptionist')
+                ON CONFLICT (staff_id) DO NOTHING
+                """,
+                booking.staff_id,
+            )
+
+            # 2. Ensure customer_id exists in resort.customer table
+            await conn.execute(
+                """
+                INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address)
+                VALUES ($1, 'Resort', 'Guest', $2, '09123456789', 'Cebu City')
+                ON CONFLICT (customer_id) DO NOTHING
+                """,
+                booking.customer_id,
+                f"{booking.customer_id.lower()}@casavista.com",
+            )
+
+            # 3. Ensure room_id exists in resort.room table if provided
+            if booking.room_id and booking.room_id.strip():
+                num = booking.room_id.replace("RM-", "")
+                await conn.execute(
+                    """
+                    INSERT INTO resort.room (room_id, room_number, rate_per_day, max_pax, status)
+                    VALUES ($1, $2, 2500.00, 4, 'Available')
+                    ON CONFLICT (room_id) DO NOTHING
+                    """,
+                    booking.room_id,
+                    num,
+                )
+
+            # 4. Ensure court_id exists in resort.court table if provided
+            if booking.court_id and booking.court_id.strip():
+                await conn.execute(
+                    """
+                    INSERT INTO resort.court (court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate)
+                    VALUES ($1, 'Court ' || $1, 'Pickleball', 400.00, 600.00, 50.00)
+                    ON CONFLICT (court_id) DO NOTHING
+                    """,
+                    booking.court_id,
+                )
+
             # 15-minute hold auto-calculation: hold_expires_at = NOW() + 15 minutes
             row = await conn.fetchrow(
                 """
@@ -754,8 +815,8 @@ async def create_booking(booking: BookingCreate):
                 booking.booking_id,
                 booking.customer_id,
                 booking.staff_id,
-                booking.room_id,
-                booking.court_id,
+                booking.room_id if booking.room_id and booking.room_id.strip() else None,
+                booking.court_id if booking.court_id and booking.court_id.strip() else None,
                 booking.booking_date,
                 booking.start_time,
                 booking.end_time,
