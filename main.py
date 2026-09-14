@@ -764,7 +764,7 @@ async def create_booking(booking: BookingCreate):
             await conn.execute(
                 """
                 INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address)
-                VALUES ($1, 'Resort', 'Guest', $2, '09123456789', 'Cebu City')
+                VALUES ($1, 'Registered', 'Customer', $2, '09123456789', 'Cebu City')
                 ON CONFLICT (customer_id) DO NOTHING
                 """,
                 booking.customer_id,
@@ -794,6 +794,45 @@ async def create_booking(booking: BookingCreate):
                     """,
                     booking.court_id,
                 )
+
+            # 5. Check for overlapping active bookings on the same room or court
+            if booking.room_id and booking.room_id.strip():
+                existing_room = await conn.fetchrow(
+                    """
+                    SELECT booking_id FROM resort.booking
+                    WHERE room_id = $1
+                      AND status IN ('Confirmed', 'Pending', 'Checked-In')
+                      AND (
+                          (check_in_date <= $3 AND check_out_date >= $2)
+                          OR booking_date = $2
+                      )
+                    """,
+                    booking.room_id,
+                    booking.check_in_date or booking.booking_date,
+                    booking.check_out_date or booking.booking_date,
+                )
+                if existing_room:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Double Booking Violation: Room {booking.room_id} is already reserved for the selected dates!"
+                    )
+
+            if booking.court_id and booking.court_id.strip():
+                existing_court = await conn.fetchrow(
+                    """
+                    SELECT booking_id FROM resort.booking
+                    WHERE court_id = $1
+                      AND status IN ('Confirmed', 'Pending', 'Checked-In')
+                      AND booking_date = $2
+                    """,
+                    booking.court_id,
+                    booking.booking_date,
+                )
+                if existing_court:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Double Booking Violation: Court {booking.court_id} is already reserved for the selected date!"
+                    )
 
             # 15-minute hold auto-calculation: hold_expires_at = NOW() + 15 minutes
             row = await conn.fetchrow(
