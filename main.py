@@ -1057,6 +1057,23 @@ async def get_booking(booking_id: str):
 async def create_booking(booking: BookingCreate):
     async with acquire_db_connection() as conn:
         try:
+            # 0. Server-Side Real-Time Past Date & Time Check (Defend against local device clock tampering)
+            today_server = date.today()
+            now_time_server = datetime.now().time()
+            target_date = booking.check_in_date or booking.booking_date
+
+            if target_date < today_server:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Booking Failure: Cannot create reservations for past dates!"
+                )
+
+            if target_date == today_server and booking.start_time and booking.start_time < now_time_server:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Booking Failure: Cannot reserve time slots that have already passed for today!"
+                )
+
             # 1. Ensure staff_id exists in resort.staff table
             await conn.execute(
                 """
