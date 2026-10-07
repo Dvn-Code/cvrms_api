@@ -476,26 +476,33 @@ async def create_customer(customer: CustomerCreate):
 )
 async def sync_google_customer(customer: CustomerSyncGoogle):
     """
-    Lightweight endpoint for Google Sign-In sync.
+    Sync endpoint for Customer account creation and profile updates.
     Accepts { email, first_name, last_name, phone, address }.
-    Creates customer if missing (using sequence customer_id_seq) and returns CustomerResponse.
+    Creates customer if missing or UPDATES existing customer details in Supabase!
     """
     async with acquire_db_connection() as conn:
         try:
-            # 1. Return existing customer if email matches
+            phone_val = customer.phone if customer.phone and customer.phone.strip() else "N/A"
+            address_val = customer.address if customer.address and customer.address.strip() else None
+
+            # 1. Update existing customer if email matches
             existing = await conn.fetchrow(
                 """
-                SELECT customer_id, first_name, last_name, email, phone, address
-                FROM resort.customer
-                WHERE LOWER(email) = LOWER($1)
+                UPDATE resort.customer
+                SET first_name = $1, last_name = $2, phone = $3, address = COALESCE($4, address)
+                WHERE LOWER(email) = LOWER($5)
+                RETURNING customer_id, first_name, last_name, email, phone, address
                 """,
+                customer.first_name,
+                customer.last_name,
+                phone_val,
+                address_val,
                 customer.email,
             )
             if existing:
                 return dict(existing)
 
             # 2. Create customer if not present
-            phone_val = customer.phone if customer.phone and customer.phone.strip() else "N/A"
             try:
                 row = await conn.fetchrow(
                     """
@@ -507,15 +514,14 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
                     customer.last_name,
                     customer.email,
                     phone_val,
-                    customer.address,
+                    address_val,
                 )
-            except (asyncpg.NotNullViolationError, asyncpg.UndefinedColumnError, asyncpg.CheckViolationError):
-                # Fallback utilizing customer_id_seq directly
+            except Exception:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address)
                     VALUES (
-                        'CST-' || LPAD(nextval('resort.customer_id_seq')::text, 5, '0'),
+                        'CUST-' || LPAD(nextval('resort.customer_id_seq')::text, 3, '0'),
                         $1, $2, $3, $4, $5
                     )
                     RETURNING customer_id, first_name, last_name, email, phone, address
@@ -524,7 +530,7 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
                     customer.last_name,
                     customer.email,
                     phone_val,
-                    customer.address,
+                    address_val,
                 )
             return dict(row)
         except Exception as err:
@@ -539,7 +545,7 @@ async def update_customer(customer_id: str, customer: CustomerUpdate):
                 """
                 UPDATE resort.customer
                 SET first_name = $1, last_name = $2, email = $3, phone = $4, address = $5
-                WHERE customer_id = $6
+                WHERE customer_id = $6 OR LOWER(email) = LOWER($6)
                 RETURNING customer_id, first_name, last_name, email, phone, address
                 """,
                 customer.first_name,
