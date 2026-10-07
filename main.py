@@ -467,13 +467,14 @@ async def send_verification_code(req: SendVerificationCodeRequest):
     print(f" Expires At: {expires_at.isoformat()}")
     print(f"==================================================\n")
 
-    # Attempt SMTP sending if environment credentials are present
-    smtp_host = os.getenv("SMTP_HOST")
+    # Attempt SMTP sending via Google Gmail / Standard SMTP
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_password = os.getenv("SMTP_PASSWORD")
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_password = os.getenv("SMTP_PASSWORD", "")
 
-    if smtp_host and smtp_user and smtp_password:
+    email_sent = False
+    if smtp_user and smtp_password:
         try:
             msg = MIMEText(
                 f"Hello,\n\nYour Casa Vista Resort verification code is: {otp_code}\n\n"
@@ -483,18 +484,20 @@ async def send_verification_code(req: SendVerificationCodeRequest):
             msg["From"] = smtp_user
             msg["To"] = email_clean
 
-            with smtplib.SMTP(smtp_host, smtp_port) as server:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
                 server.starttls()
                 server.login(smtp_user, smtp_password)
                 server.send_message(msg)
+            email_sent = True
             print(f"✓ OTP Email successfully dispatched via SMTP to {email_clean}")
         except Exception as err:
-            print(f"Notice: SMTP dispatch failed ({err}). Dev code remains active: [DEV OTP]: {otp_code}")
+            print(f"Notice: SMTP dispatch failed ({err}). Dev code active: [DEV OTP]: {otp_code}")
 
     return {
         "status": "success",
-        "message": "Verification code sent to email.",
+        "message": "Verification code sent to email." if email_sent else f"Verification code generated ([DEV OTP]: {otp_code}).",
         "email": email_clean,
+        "dev_otp": otp_code,
     }
 
 
