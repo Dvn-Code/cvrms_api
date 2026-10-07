@@ -96,12 +96,10 @@ class CustomerBase(BaseModel):
 
     @field_validator("first_name", "last_name")
     @classmethod
-    def names_must_not_contain_digits(cls, v: Optional[str]) -> Optional[str]:
+    def sanitize_names(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
             return None
-        if any(char.isdigit() for char in v):
-            raise ValueError("Names cannot contain numbers.")
-        return v
+        return v.strip()
 
     @field_validator("email")
     @classmethod
@@ -124,12 +122,10 @@ class CustomerSyncGoogle(BaseModel):
 
     @field_validator("first_name", "last_name")
     @classmethod
-    def names_must_not_contain_digits(cls, v: Optional[str]) -> Optional[str]:
+    def sanitize_names(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
             return None
-        if any(char.isdigit() for char in v):
-            raise ValueError("Names cannot contain numbers.")
-        return v
+        return v.strip()
 
     @field_validator("email")
     @classmethod
@@ -155,12 +151,10 @@ class StaffBase(BaseModel):
 
     @field_validator("first_name", "last_name")
     @classmethod
-    def names_must_not_contain_digits(cls, v: Optional[str]) -> Optional[str]:
+    def sanitize_names(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
             return None
-        if any(char.isdigit() for char in v):
-            raise ValueError("Staff names cannot contain numbers.")
-        return v
+        return v.strip()
 
 
 class StaffCreate(StaffBase):
