@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Literal
+from typing import List, Literal, Optional, Union
 
 import asyncpg
 from dotenv import load_dotenv
@@ -15,22 +17,6 @@ except Exception:
     EmailStr = str
 
 load_dotenv()
-
-#This is the main.py (FastAPI) for CVRMS (Casa Vista Resort Management System) API, which serves as the backend for managing resort accommodations, sports amenities, cashless payments, and POS retail modules. It includes database connection configuration, application lifespan management, Pydantic schemas for data validation, and CRUD operations for customers, staff, rooms, courts, bookings, payments, and POS items.
-#Members: Abarquez, Divinangelo; Astrologo, Russell John; Cabilao, John Michael
-#We intended to use FastAPI plus Supabase instead of local PHP since the client is serious in deploying this project and we have learned so much during our ITE 298 course.
-#With that, this code already included github license (Apache 2.0) and we will be using this code for our final project in ITE 298.
-#We also added a vercel.json and requirements.txt for free online hosting of the FastAPI.
-#We have successfully deployed this project on Vercel and the link is https://cvrms-api.vercel.app/docs 
-#We also successfully tried to register a customer in our Android Application, and thankfuly it worked after how many days of debugging.
-#Plus, we also successfully connected a user to Supabase's auth.users with encrypted password.
-#We also finished including Google Log-in Authentication for our Android App still incorporating Supabase with this FastAPI. 
-#The limitations, however, for this P2 submission is that we haven't tried to actualy book a room yet. We still focused on registering an account (customer), not yet admin too.
-#There's also no POS yet. Hehehe we don't know how to yet.
-#Any feedbacks, suggestions, and comments are welcome. Thank you for your time and consideration sir.
-#Note: We acknowledge that we used AI for this project but we also made sure to understand atleast the logic and flow of the code.
-#- we also watched a lot of youtube videos and read some articles to understand the code and how to implement it in our Android Application.
-#Thank you so much!
 
 # =============================================================================
 # DATABASE CONNECTION CONFIGURATION
@@ -104,13 +90,13 @@ class CustomerBase(BaseModel):
 
     first_name: str = Field(min_length=1, max_length=50)
     last_name: str = Field(min_length=1, max_length=50)
-    email: EmailStr | None = Field(default=None, max_length=120)
+    email: Optional[EmailStr] = Field(default=None, max_length=120)
     phone: str = Field(min_length=7, max_length=20)
-    address: str | None = Field(default=None, max_length=255)
+    address: Optional[str] = Field(default=None, max_length=255)
 
     @field_validator("first_name", "last_name")
     @classmethod
-    def names_must_not_contain_digits(cls, v: str | None) -> str | None:
+    def names_must_not_contain_digits(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
             return None
         if any(char.isdigit() for char in v):
@@ -119,12 +105,36 @@ class CustomerBase(BaseModel):
 
     @field_validator("email")
     @classmethod
-    def normalize_email(cls, v: str | None) -> str | None:
+    def normalize_email(cls, v: Optional[str]) -> Optional[str]:
         return v.lower() if v else None
 
 
 class CustomerCreate(CustomerBase):
     pass
+
+
+class CustomerSyncGoogle(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    email: EmailStr
+    first_name: str = Field(min_length=1, max_length=50)
+    last_name: str = Field(min_length=1, max_length=50)
+    phone: Optional[str] = Field(default="N/A", max_length=20)
+    address: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def names_must_not_contain_digits(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        if any(char.isdigit() for char in v):
+            raise ValueError("Names cannot contain numbers.")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: Optional[str]) -> Optional[str]:
+        return v.lower() if v else None
 
 
 class CustomerUpdate(CustomerBase):
@@ -145,7 +155,7 @@ class StaffBase(BaseModel):
 
     @field_validator("first_name", "last_name")
     @classmethod
-    def names_must_not_contain_digits(cls, v: str | None) -> str | None:
+    def names_must_not_contain_digits(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
             return None
         if any(char.isdigit() for char in v):
@@ -214,24 +224,24 @@ class CourtResponse(CourtBase):
 class BookingBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    customer_id: str = Field(min_length=3, max_length=10)
+    customer_id: str = Field(min_length=3, max_length=20)
     staff_id: str = Field(min_length=3, max_length=10)
-    room_id: str | None = Field(default=None, max_length=10)
-    court_id: str | None = Field(default=None, max_length=10)
+    room_id: Optional[str] = Field(default=None, max_length=10)
+    court_id: Optional[str] = Field(default=None, max_length=10)
     booking_date: date
-    start_time: time | None = None
-    end_time: time | None = None
-    check_in_date: date | None = None
-    check_out_date: date | None = None
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
+    check_in_date: Optional[date] = None
+    check_out_date: Optional[date] = None
     exclusive: bool = False
     paddle_count: int = Field(default=0, ge=0)
     status: Literal["Pending", "Confirmed", "Checked-In", "Completed", "Cancelled"] = "Pending"
 
     @model_validator(mode="after")
-    def validate_exclusive_booking_arc(self) -> "BookingBase":
+    def validate_exclusive_booking_arc(self) -> BookingBase:
         # Database constraint enforcement: XOR between room_id and court_id
-        has_room = self.room_id is not None and self.room_id != ""
-        has_court = self.court_id is not None and self.court_id != ""
+        has_room = self.room_id is not None and self.room_id.strip() != ""
+        has_court = self.court_id is not None and self.court_id.strip() != ""
 
         if not (has_room ^ has_court):
             raise ValueError(
@@ -258,7 +268,7 @@ class BookingUpdate(BookingBase):
 class BookingResponse(BookingBase):
     booking_id: str
     created_at: datetime
-    hold_expires_at: datetime | None
+    hold_expires_at: Optional[datetime] = None
 
 
 # --- PAYMENT SCHEMAS ---
@@ -266,17 +276,17 @@ class PaymentCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     payment_id: str = Field(min_length=3, max_length=15, examples=["PAY-001"])
-    booking_id: str | None = Field(default=None, max_length=15)
-    order_id: str | None = Field(default=None, max_length=15)
+    booking_id: Optional[str] = Field(default=None, max_length=15)
+    order_id: Optional[str] = Field(default=None, max_length=15)
     amount: Decimal = Field(gt=Decimal("0.00"), decimal_places=2)
     method: Literal["Cash", "Card", "GCash", "Maya", "Online Gateway"]
     payment_type: Literal["Payment", "Refund"] = "Payment"
 
     @model_validator(mode="after")
-    def validate_exclusive_payment_arc(self) -> "PaymentCreate":
+    def validate_exclusive_payment_arc(self) -> PaymentCreate:
         # Database constraint enforcement: XOR between booking_id and order_id
-        has_booking = self.booking_id is not None and self.booking_id != ""
-        has_order = self.order_id is not None and self.order_id != ""
+        has_booking = self.booking_id is not None and self.booking_id.strip() != ""
+        has_order = self.order_id is not None and self.order_id.strip() != ""
 
         if not (has_booking ^ has_order):
             raise ValueError(
@@ -287,8 +297,8 @@ class PaymentCreate(BaseModel):
 
 class PaymentResponse(BaseModel):
     payment_id: str
-    booking_id: str | None
-    order_id: str | None
+    booking_id: Optional[str] = None
+    order_id: Optional[str] = None
     amount: Decimal
     method: str
     payment_type: str
@@ -334,18 +344,18 @@ class POSOrderCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     order_id: str = Field(min_length=3, max_length=15, examples=["ORD-001"])
-    customer_id: str | None = Field(default=None, max_length=10)
+    customer_id: Optional[str] = Field(default=None, max_length=20)
     staff_id: str = Field(min_length=3, max_length=10)
-    items: list[POSOrderItemCreate] = Field(min_length=1)
+    items: List[POSOrderItemCreate] = Field(min_length=1)
 
 
 class POSOrderResponse(BaseModel):
     order_id: str
-    customer_id: str | None
+    customer_id: Optional[str] = None
     staff_id: str
     order_date: datetime
     total_amount: Decimal
-    items: list[POSOrderItemResponse] = []
+    items: List[POSOrderItemResponse] = []
 
 
 # =============================================================================
@@ -353,7 +363,6 @@ class POSOrderResponse(BaseModel):
 # =============================================================================
 def handle_db_exception(err: Exception) -> None:
     """Translates asyncpg database errors into structured, rubric-compliant HTTP exceptions."""
-    # PRINT THE ACTUAL DATABASE ERROR TO TERMINAL
     print(f"\n>>> [DATABASE ERROR TRIGGERED]: {type(err).__name__} -> {err}\n")
 
     if isinstance(err, asyncpg.UniqueViolationError):
@@ -371,14 +380,15 @@ def handle_db_exception(err: Exception) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Business rule violation: {err.detail or 'Operation failed a database CHECK constraint.'}",
         )
-    # Include the error message in the 500 response while debugging
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail=f"Database Error ({type(err).__name__}): {str(err)}",
     )
 
 
-async def verify_staff_token(x_staff_token: str | None = Header(default=None)):
+async def verify_staff_token(
+    x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token")
+):
     """
     Guards administrative and analytical endpoints.
     Returns HTTP 401 Unauthorized if the client omits or supplies an invalid token.
@@ -407,9 +417,9 @@ def read_root():
 
 
 # =============================================================================
-# RESORT MODULE: CUSTOMERS CRUD
+# RESORT MODULE: CUSTOMERS CRUD & GOOGLE OAUTH SYNC
 # =============================================================================
-@app.get("/customers", response_model=list[CustomerResponse], tags=["Customers"])
+@app.get("/customers", response_model=List[CustomerResponse], tags=["Customers"])
 async def get_customers():
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
@@ -429,7 +439,7 @@ async def get_customer(customer_id: str):
             """
             SELECT customer_id, first_name, last_name, email, phone, address
             FROM resort.customer
-            WHERE customer_id = $1
+            WHERE customer_id = $1 OR LOWER(email) = LOWER($1)
             """,
             customer_id,
         )
@@ -459,6 +469,69 @@ async def create_customer(customer: CustomerCreate):
                 customer.phone,
                 customer.address,
             )
+            return dict(row)
+        except Exception as err:
+            handle_db_exception(err)
+
+
+@app.post(
+    "/customers/sync-google",
+    status_code=status.HTTP_200_OK,
+    response_model=CustomerResponse,
+    tags=["Customers"],
+)
+async def sync_google_customer(customer: CustomerSyncGoogle):
+    """
+    Lightweight endpoint for Google Sign-In sync.
+    Accepts { email, first_name, last_name, phone, address }.
+    Creates customer if missing (using sequence customer_id_seq) and returns CustomerResponse.
+    """
+    async with acquire_db_connection() as conn:
+        try:
+            # 1. Return existing customer if email matches
+            existing = await conn.fetchrow(
+                """
+                SELECT customer_id, first_name, last_name, email, phone, address
+                FROM resort.customer
+                WHERE LOWER(email) = LOWER($1)
+                """,
+                customer.email,
+            )
+            if existing:
+                return dict(existing)
+
+            # 2. Create customer if not present
+            phone_val = customer.phone if customer.phone and customer.phone.strip() else "N/A"
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO resort.customer (first_name, last_name, email, phone, address)
+                    VALUES ($1, $2, $3, $4, $5)
+                    RETURNING customer_id, first_name, last_name, email, phone, address
+                    """,
+                    customer.first_name,
+                    customer.last_name,
+                    customer.email,
+                    phone_val,
+                    customer.address,
+                )
+            except (asyncpg.NotNullViolationError, asyncpg.UndefinedColumnError, asyncpg.CheckViolationError):
+                # Fallback utilizing customer_id_seq directly
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address)
+                    VALUES (
+                        'CST-' || LPAD(nextval('resort.customer_id_seq')::text, 5, '0'),
+                        $1, $2, $3, $4, $5
+                    )
+                    RETURNING customer_id, first_name, last_name, email, phone, address
+                    """,
+                    customer.first_name,
+                    customer.last_name,
+                    customer.email,
+                    phone_val,
+                    customer.address,
+                )
             return dict(row)
         except Exception as err:
             handle_db_exception(err)
@@ -512,7 +585,7 @@ async def delete_customer(customer_id: str):
 # =============================================================================
 # RESORT MODULE: STAFF CRUD
 # =============================================================================
-@app.get("/staff", response_model=list[StaffResponse], tags=["Staff"])
+@app.get("/staff", response_model=List[StaffResponse], tags=["Staff"])
 async def get_staff_members():
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
@@ -550,8 +623,8 @@ async def create_staff(staff: StaffCreate):
 # =============================================================================
 # RESORT MODULE: ROOM INVENTORY & TARIFFS CRUD
 # =============================================================================
-@app.get("/rooms", response_model=list[RoomResponse], tags=["Rooms"])
-async def get_rooms(status_filter: str | None = Query(default=None, alias="status")):
+@app.get("/rooms", response_model=List[RoomResponse], tags=["Rooms"])
+async def get_rooms(status_filter: Optional[str] = Query(default=None, alias="status")):
     async with acquire_db_connection() as conn:
         if status_filter:
             rows = await conn.fetch(
@@ -649,9 +722,9 @@ async def update_room(room_id: str, room: RoomUpdate):
 
 
 # =============================================================================
-# RESORT MODULE: SPORTS COURTS CRUD
+# RESORT MODULE: SPORTS COURTS CRUD & DYNAMIC PRICING / AVAILABILITY
 # =============================================================================
-@app.get("/courts", response_model=list[CourtResponse], tags=["Courts"])
+@app.get("/courts", response_model=List[CourtResponse], tags=["Courts"])
 async def get_courts():
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
@@ -662,6 +735,85 @@ async def get_courts():
             """
         )
         return [dict(r) for r in rows]
+
+
+@app.get("/courts/calculate-price", tags=["Courts"])
+def calculate_court_price(
+    court_type: Literal["Pickleball", "Basketball"],
+    start_time: time = Query(..., description="Start time e.g. 08:00"),
+    end_time: time = Query(..., description="End time e.g. 10:00"),
+    paddle_count: int = Query(default=0, ge=0),
+):
+    """
+    Calculates dynamic court reservation cost based on time of day and paddle rentals.
+    - Daytime (06:00 - 18:00): Pickleball ₱400/hr, Basketball ₱500/hr
+    - Nighttime (18:00 - 22:00): Pickleball ₱600/hr, Basketball ₱750/hr
+    - Paddle rental: ₱100/paddle
+    """
+    if start_time >= end_time:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_time must be earlier than end_time.",
+        )
+
+    day_rate = Decimal("400.00") if court_type == "Pickleball" else Decimal("500.00")
+    night_rate = Decimal("600.00") if court_type == "Pickleball" else Decimal("750.00")
+    paddle_rate = Decimal("100.00")
+
+    st_hours = start_time.hour + start_time.minute / 60.0
+    et_hours = end_time.hour + end_time.minute / 60.0
+
+    day_hours = max(0.0, min(et_hours, 18.0) - max(st_hours, 6.0))
+    night_hours = max(0.0, min(et_hours, 22.0) - max(st_hours, 18.0))
+
+    court_cost = (Decimal(str(day_hours)) * day_rate) + (Decimal(str(night_hours)) * night_rate)
+    paddle_cost = Decimal(paddle_count) * paddle_rate
+    total_cost = court_cost + paddle_cost
+
+    return {
+        "court_type": court_type,
+        "start_time": start_time.strftime("%H:%M"),
+        "end_time": end_time.strftime("%H:%M"),
+        "daytime_hours": day_hours,
+        "nighttime_hours": night_hours,
+        "court_cost": court_cost,
+        "paddle_count": paddle_count,
+        "paddle_cost": paddle_cost,
+        "total_cost": total_cost,
+    }
+
+
+@app.get("/courts/{court_id}/availability", tags=["Courts"])
+async def get_court_availability(
+    court_id: str,
+    booking_date: date = Query(default_factory=date.today, description="Booking date (YYYY-MM-DD)"),
+):
+    """
+    Returns all active holds (Pending with hold_expires_at > NOW()) and confirmed reservations for a court on a date.
+    """
+    async with acquire_db_connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT booking_id, customer_id, staff_id, court_id, booking_date,
+                   start_time, end_time, exclusive, paddle_count, status,
+                   created_at, hold_expires_at
+            FROM resort.booking
+            WHERE court_id = $1
+              AND booking_date = $2
+              AND (
+                  status IN ('Confirmed', 'Checked-In')
+                  OR (status = 'Pending' AND hold_expires_at > CURRENT_TIMESTAMP)
+              )
+            ORDER BY start_time
+            """,
+            court_id,
+            booking_date,
+        )
+        return {
+            "court_id": court_id,
+            "booking_date": booking_date,
+            "reserved_slots": [dict(r) for r in rows],
+        }
 
 
 @app.post(
@@ -695,8 +847,8 @@ async def create_court(court: CourtCreate):
 # =============================================================================
 # RESORT MODULE: RESERVATIONS & BOOKINGS CRUD
 # =============================================================================
-@app.get("/bookings", response_model=list[BookingResponse], tags=["Bookings"])
-async def get_bookings(status_filter: str | None = Query(default=None, alias="status")):
+@app.get("/bookings", response_model=List[BookingResponse], tags=["Bookings"])
+async def get_bookings(status_filter: Optional[str] = Query(default=None, alias="status")):
     async with acquire_db_connection() as conn:
         if status_filter:
             rows = await conn.fetch(
@@ -720,6 +872,26 @@ async def get_bookings(status_filter: str | None = Query(default=None, alias="st
                 ORDER BY created_at DESC
                 """
             )
+        return [dict(r) for r in rows]
+
+
+@app.get("/bookings/active", response_model=List[BookingResponse], tags=["Bookings"])
+async def get_active_bookings():
+    """
+    Returns all currently active bookings: Confirmed, Checked-In, or Pending holds that have not expired.
+    """
+    async with acquire_db_connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT booking_id, customer_id, staff_id, room_id, court_id, booking_date,
+                   start_time, end_time, check_in_date, check_out_date, exclusive,
+                   paddle_count, status, created_at, hold_expires_at
+            FROM resort.booking
+            WHERE status IN ('Confirmed', 'Checked-In')
+               OR (status = 'Pending' AND hold_expires_at > CURRENT_TIMESTAMP)
+            ORDER BY created_at DESC
+            """
+        )
         return [dict(r) for r in rows]
 
 
@@ -789,7 +961,7 @@ async def create_booking(booking: BookingCreate):
                 await conn.execute(
                     """
                     INSERT INTO resort.court (court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate)
-                    VALUES ($1, 'Court ' || $1, 'Pickleball', 400.00, 600.00, 50.00)
+                    VALUES ($1::varchar, 'Court ' || $1::varchar, 'Pickleball', 400.00, 600.00, 100.00)
                     ON CONFLICT (court_id) DO NOTHING
                     """,
                     booking.court_id,
@@ -801,7 +973,10 @@ async def create_booking(booking: BookingCreate):
                     """
                     SELECT booking_id FROM resort.booking
                     WHERE room_id = $1
-                      AND status IN ('Confirmed', 'Pending', 'Checked-In')
+                      AND (
+                          status IN ('Confirmed', 'Checked-In')
+                          OR (status = 'Pending' AND hold_expires_at > CURRENT_TIMESTAMP)
+                      )
                       AND (
                           (check_in_date <= $3 AND check_out_date >= $2)
                           OR booking_date = $2
@@ -822,19 +997,28 @@ async def create_booking(booking: BookingCreate):
                     """
                     SELECT booking_id FROM resort.booking
                     WHERE court_id = $1
-                      AND status IN ('Confirmed', 'Pending', 'Checked-In')
+                      AND (
+                          status IN ('Confirmed', 'Checked-In')
+                          OR (status = 'Pending' AND hold_expires_at > CURRENT_TIMESTAMP)
+                      )
                       AND booking_date = $2
+                      AND (
+                          ($3::time IS NULL OR $4::time IS NULL)
+                          OR (start_time < $4 AND end_time > $3)
+                      )
                     """,
                     booking.court_id,
                     booking.booking_date,
+                    booking.start_time,
+                    booking.end_time,
                 )
                 if existing_court:
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Double Booking Violation: Court {booking.court_id} is already reserved for the selected date!"
+                        detail=f"Double Booking Violation: Court {booking.court_id} is already reserved for the selected date and time!"
                     )
 
-            # 15-minute hold auto-calculation: hold_expires_at = NOW() + 15 minutes
+            # Enforce 15-minute hold auto-calculation & status = 'Pending'
             row = await conn.fetchrow(
                 """
                 INSERT INTO resort.booking (
@@ -845,7 +1029,7 @@ async def create_booking(booking: BookingCreate):
                 VALUES (
                     $1, $2, $3, $4, $5, $6,
                     $7, $8, $9, $10, $11,
-                    $12, $13, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '15 minutes'
+                    $12, 'Pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '15 minutes'
                 )
                 RETURNING booking_id, customer_id, staff_id, room_id, court_id, booking_date,
                           start_time, end_time, check_in_date, check_out_date, exclusive,
@@ -863,9 +1047,10 @@ async def create_booking(booking: BookingCreate):
                 booking.check_out_date,
                 booking.exclusive,
                 booking.paddle_count,
-                booking.status,
             )
             return dict(row)
+        except HTTPException:
+            raise
         except Exception as err:
             handle_db_exception(err)
 
@@ -927,7 +1112,7 @@ async def process_payment(payment: PaymentCreate):
                         )
 
                     # Compute scheduled reservation start
-                    sched_date = booking["check_in_date"]
+                    sched_date = booking["check_in_date"] or date.today()
                     sched_time = booking["start_time"] or time(14, 0)
                     sched_dt = datetime.combine(sched_date, sched_time)
 
@@ -944,17 +1129,21 @@ async def process_payment(payment: PaymentCreate):
                     RETURNING payment_id, booking_id, order_id, amount, method, payment_type, paid_at
                     """,
                     payment.payment_id,
-                    payment.booking_id,
-                    payment.order_id,
+                    payment.booking_id if payment.booking_id and payment.booking_id.strip() else None,
+                    payment.order_id if payment.order_id and payment.order_id.strip() else None,
                     payment.amount,
                     payment.method,
                     payment.payment_type,
                 )
 
-                # Auto-confirm booking upon successful full payment capture
-                if payment.booking_id and payment.payment_type == "Payment":
+                # Captured full payments automatically flip the linked booking status from 'Pending' to 'Confirmed'
+                if payment.booking_id and payment.booking_id.strip() and payment.payment_type == "Payment":
                     await conn.execute(
-                        "UPDATE resort.booking SET status = 'Confirmed' WHERE booking_id = $1 AND status = 'Pending'",
+                        """
+                        UPDATE resort.booking
+                        SET status = 'Confirmed'
+                        WHERE booking_id = $1 AND status = 'Pending'
+                        """,
                         payment.booking_id,
                     )
 
@@ -968,7 +1157,7 @@ async def process_payment(payment: PaymentCreate):
 # =============================================================================
 # POS MODULE: PRODUCT CATALOG CRUD
 # =============================================================================
-@app.get("/pos/items", response_model=list[POSItemResponse], tags=["POS Catalog"])
+@app.get("/pos/items", response_model=List[POSItemResponse], tags=["POS Catalog"])
 async def get_pos_items():
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
@@ -1249,8 +1438,8 @@ async def report_financial_payments():
     dependencies=[Depends(verify_staff_token)],
 )
 async def get_revenue_pnl_summary(
-    start_date: date | None = Query(default=None, description="Filter from date (YYYY-MM-DD)"),
-    end_date: date | None = Query(default=None, description="Filter to date (YYYY-MM-DD)"),
+    start_date: Optional[date] = Query(default=None, description="Filter from date (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(default=None, description="Filter to date (YYYY-MM-DD)"),
 ):
     """
     Computes real-time Profit & Loss / Revenue analytics directly from the payment ledger.
