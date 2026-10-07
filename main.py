@@ -1193,7 +1193,7 @@ async def create_booking(booking: BookingCreate):
 @app.put("/bookings/{booking_id}/status", response_model=BookingResponse, tags=["Bookings"])
 async def update_booking_status(
     booking_id: str,
-    new_status: Literal["Pending", "Confirmed", "Checked-In", "Completed", "Cancelled"],
+    new_status: Literal["Pending", "Confirmed", "Checked-In", "Completed", "Cancelled"] = Query(..., alias="new_status"),
 ):
     async with acquire_db_connection() as conn:
         try:
@@ -1214,6 +1214,8 @@ async def update_booking_status(
                     status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found."
                 )
             return dict(row)
+        except HTTPException:
+            raise
         except Exception as err:
             handle_db_exception(err)
 
