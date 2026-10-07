@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import random
+import smtplib
 from contextlib import asynccontextmanager
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+from email.mime.text import MIMEText
 from typing import List, Literal, Optional, Union
 
 import asyncpg
@@ -407,6 +410,135 @@ def read_root():
         "status": "Operational",
         "version": "2.0.0",
         "schemas": ["resort", "pos"],
+    }
+
+
+# =============================================================================
+# IN-MEMORY OTP VERIFICATION STORE & MODELS
+# =============================================================================
+verification_store: dict[str, dict] = {}
+
+
+class SendVerificationCodeRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return v.lower()
+
+
+class VerifyCodeRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    email: EmailStr
+    code: str
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return v.lower()
+
+
+# =============================================================================
+# AUTHENTICATION & EMAIL OTP VERIFICATION ENDPOINTS
+# =============================================================================
+@app.post(
+    "/auth/send-verification-code",
+    status_code=status.HTTP_200_OK,
+    tags=["Authentication"],
+)
+async def send_verification_code(req: SendVerificationCodeRequest):
+    """
+    Generates a 6-digit verification code with 5-minute expiry.
+    Sends code via SMTP if configured, or prints [DEV OTP] to terminal console.
+    """
+    email_clean = req.email.lower()
+    otp_code = f"{random.randint(100000, 999999):06d}"
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    verification_store[email_clean] = {
+        "code": otp_code,
+        "expires_at": expires_at,
+    }
+
+    print(f"\n==================================================")
+    print(f" [DEV OTP GENERATED]: {otp_code} for {email_clean}")
+    print(f" Expires At: {expires_at.isoformat()}")
+    print(f"==================================================\n")
+
+    # Attempt SMTP sending if environment credentials are present
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+
+    if smtp_host and smtp_user and smtp_password:
+        try:
+            msg = MIMEText(
+                f"Hello,\n\nYour Casa Vista Resort verification code is: {otp_code}\n\n"
+                f"This code will expire in 5 minutes.\n\nThank you,\nCasa Vista Resort Team"
+            )
+            msg["Subject"] = "Casa Vista Resort - Email Verification Code"
+            msg["From"] = smtp_user
+            msg["To"] = email_clean
+
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+            print(f"✓ OTP Email successfully dispatched via SMTP to {email_clean}")
+        except Exception as err:
+            print(f"Notice: SMTP dispatch failed ({err}). Dev code remains active: [DEV OTP]: {otp_code}")
+
+    return {
+        "status": "success",
+        "message": "Verification code sent to email.",
+        "email": email_clean,
+    }
+
+
+@app.post(
+    "/auth/verify-code",
+    status_code=status.HTTP_200_OK,
+    tags=["Authentication"],
+)
+async def verify_code(req: VerifyCodeRequest):
+    """
+    Verifies the 6-digit OTP code against the verification store.
+    Invalidates code upon successful verification.
+    """
+    email_clean = req.email.lower()
+    user_code = req.code.strip()
+
+    entry = verification_store.get(email_clean)
+
+    if not entry:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired code. Please try again.",
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    if now_utc > entry["expires_at"]:
+        verification_store.pop(email_clean, None)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired code. Please try again.",
+        )
+
+    if entry["code"] != user_code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired code. Please try again.",
+        )
+
+    # Code matches! Invalidate so it cannot be reused.
+    verification_store.pop(email_clean, None)
+
+    return {
+        "verified": True,
+        "message": "Email verified successfully.",
     }
 
 
