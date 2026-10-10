@@ -13,11 +13,8 @@ from typing import List, Literal, Optional, Union
 
 import asyncpg
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
 
 try:
     from pydantic import EmailStr
@@ -61,48 +58,49 @@ async def lifespan(app: FastAPI):
 
 
 # =============================================================================
-# GLOBAL HTTP BASIC AUTH & STAFF TOKEN MIDDLEWARE
+# GLOBAL HTTP BASIC AUTH & STAFF TOKEN GUARD
 # =============================================================================
-class BasicAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        # Allow OPTIONS requests for CORS preflight
-        if request.method == "OPTIONS":
-            return await call_next(request)
+async def verify_staff_token(
+    request: Request,
+    x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
+):
+    """
+    Guards ALL endpoints globally.
+    Requires either HTTP Basic Auth:
+    Username: cvrms_prd_service_account
+    Password: SWU_Root2026!!
+    OR valid X-Staff-Token header.
+    """
+    if request.method == "OPTIONS":
+        return
 
-        auth_header = request.headers.get("Authorization")
-        staff_header = request.headers.get("X-Staff-Token")
+    ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
+    ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "SWU_Root2026!!")
+    STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
 
-        ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
-        ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "SWU_Root2026!!")
-        STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
+    # 1. Check X-Staff-Token header
+    if x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
+        return
 
-        authenticated = False
+    # 2. Check HTTP Basic Authorization header
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Basic "):
+        try:
+            encoded = auth_header.split(" ", 1)[1]
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            if ":" in decoded:
+                username, password = decoded.split(":", 1)
+                if secrets.compare_digest(username, ADMIN_USER) and secrets.compare_digest(password, ADMIN_PASS):
+                    return
+        except Exception:
+            pass
 
-        if auth_header and auth_header.startswith("Basic "):
-            try:
-                encoded = auth_header.split(" ", 1)[1]
-                decoded = base64.b64decode(encoded).decode("utf-8")
-                if ":" in decoded:
-                    username, password = decoded.split(":", 1)
-                    if secrets.compare_digest(username, ADMIN_USER) and secrets.compare_digest(password, ADMIN_PASS):
-                        authenticated = True
-            except Exception:
-                authenticated = False
-
-        if not authenticated and staff_header and secrets.compare_digest(staff_header, STAFF_SECRET):
-            authenticated = True
-
-        if not authenticated:
-            return Response(
-                content='{"detail": "Unauthorized: Basic Auth (cvrms_prd_service_account / SWU_Root2026!!) or X-Staff-Token required."}',
-                status_code=401,
-                headers={
-                    "WWW-Authenticate": 'Basic realm="CVRMS Protected API"',
-                    "Content-Type": "application/json",
-                },
-            )
-
-        return await call_next(request)
+    # 3. Reject with HTTP 401 and WWW-Authenticate header to pop up browser login box
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized: Admin credentials (Username: cvrms_prd_service_account / Password) or valid X-Staff-Token required.",
+        headers={"WWW-Authenticate": 'Basic realm="CVRMS Protected API"'},
+    )
 
 
 app = FastAPI(
@@ -110,9 +108,8 @@ app = FastAPI(
     description="Backend API supporting Resort Accommodations, Sports Amenities, Cashless Payments, and POS Retail Modules.",
     version="2.0.0",
     lifespan=lifespan,
+    dependencies=[Depends(verify_staff_token)],
 )
-
-app.add_middleware(BasicAuthMiddleware)
 
 
 @asynccontextmanager
