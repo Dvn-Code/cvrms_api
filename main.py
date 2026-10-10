@@ -28,11 +28,11 @@ except Exception:
 load_dotenv()
 
 # =============================================================================
-# DATABASE CONNECTION CONFIGURATION
+# DATABASE CONFIGURATION (NO HARDCODED DB PASSWORDS)
 # =============================================================================
-DB_USER = os.getenv("DB_USER", "cvrms_prd_service_account.knobgbjusbcqaatizjld")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "SWU_Root2026!!")
-DB_HOST = os.getenv("DB_HOST", "aws-0-ap-southeast-1.pooler.supabase.com")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT", "6543")
 DB_NAME = os.getenv("DB_NAME", "postgres")
 
@@ -62,17 +62,18 @@ async def lifespan(app: FastAPI):
 
 
 # =============================================================================
-# SWAGGER GATEWAY AUTHENTICATION (BROWSER POPUP ONLY)
+# SWAGGER & STAFF AUTHENTICATION GUARDS
 # =============================================================================
 docs_security = HTTPBasic(auto_error=True)
 
+# Swagger Docs credentials
 ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
 ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "@Guest12345")
 STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
 
 
 def verify_swagger_credentials(credentials: HTTPBasicCredentials = Depends(docs_security)):
-    """Browser basic auth guard protecting /docs and /redoc."""
+    """Browser basic auth guard protecting /docs and /redoc[cite: 4]."""
     is_user_valid = secrets.compare_digest(credentials.username, ADMIN_USER)
     is_pass_valid = secrets.compare_digest(credentials.password, ADMIN_PASS)
 
@@ -90,9 +91,8 @@ async def verify_staff_token(
     x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
 ):
     """
-    Staff guard that checks X-Staff-Token or Authorization headers directly.
-    Does NOT register an OpenAPI security scheme, keeping the Swagger UI free
-    of the green "Authorize" button.
+    Staff guard that checks X-Staff-Token or Authorization headers directly[cite: 4].
+    Does NOT register an OpenAPI security scheme, keeping Swagger UI free of the green lock[cite: 4].
     """
     if x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
         return x_staff_token
@@ -116,7 +116,7 @@ async def verify_staff_token(
 
 
 # =============================================================================
-# FASTAPI APP INSTANCE
+# FASTAPI INSTANCE (DEFAULT SWAGGER URLS DISABLED)
 # =============================================================================
 app = FastAPI(
     title="Casa Vista Resort Management System (CVRMS) API",
@@ -130,7 +130,7 @@ app = FastAPI(
 
 
 # =============================================================================
-# PROTECTED SWAGGER ROUTES (NO GREEN AUTHORIZE BUTTON)
+# PROTECTED SWAGGER ROUTES (BASIC AUTH POPUP, NO GREEN LOCK)
 # =============================================================================
 @app.get("/docs", include_in_schema=False)
 async def get_swagger_ui(username: str = Depends(verify_swagger_credentials)):
@@ -164,14 +164,8 @@ async def get_openapi_schema(username: str = Depends(verify_swagger_credentials)
 async def acquire_db_connection():
     pool = getattr(app.state, "pool", None)
     if pool is None or getattr(pool, "_closed", True):
-        user = os.getenv("DB_USER", "cvrms_prd_service_account.knobgbjusbcqaatizjld")
-        password = os.getenv("DB_PASSWORD", "SWU_Root2026!!")
-        host = os.getenv("DB_HOST", "aws-0-ap-southeast-1.pooler.supabase.com")
-        port = os.getenv("DB_PORT", "6543")
-        dbname = os.getenv("DB_NAME", "postgres")
-        db_url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
         app.state.pool = await asyncpg.create_pool(
-            db_url,
+            DATABASE_URL,
             min_size=1,
             max_size=5,
             statement_cache_size=0,
@@ -238,7 +232,6 @@ class CustomerUpdate(CustomerBase):
     pass
 
 
-# Response model does not enforce registration validation rules
 class CustomerResponse(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -1006,7 +999,7 @@ async def create_court(court: CourtCreate):
 
 
 # =============================================================================
-# RESORT MODULE: RESERVATIONS & BOOKINGS CRUD (SCHEMA ALIGNED)
+# RESORT MODULE: RESERVATIONS & BOOKINGS CRUD
 # =============================================================================
 @app.get("/bookings", response_model=List[BookingResponse], tags=["Bookings"])
 async def get_bookings(status_filter: Optional[str] = Query(default=None, alias="status")):
@@ -1138,7 +1131,7 @@ async def create_booking(booking: BookingCreate):
 
                 is_room_booking = booking.check_in_date is not None and booking.check_out_date is not None
 
-                # Enforce chk_booking_shape constraint at database level
+                # Enforce chk_booking_shape constraint at database level[cite: 3]
                 court_id_val = None if is_room_booking else (booking.court_id if booking.court_id and booking.court_id.strip() else None)
                 start_time_val = None if is_room_booking else booking.start_time
                 end_time_val = None if is_room_booking else booking.end_time
