@@ -60,9 +60,12 @@ async def lifespan(app: FastAPI):
 # =============================================================================
 # GLOBAL HTTP BASIC AUTH & STAFF TOKEN GUARD
 # =============================================================================
+security = HTTPBasic(auto_error=False)
+
+
 async def verify_staff_token(
-    request: Request,
     x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
+    credentials: Optional[HTTPBasicCredentials] = Depends(security),
 ):
     """
     Guards ALL endpoints globally.
@@ -71,31 +74,22 @@ async def verify_staff_token(
     Password: SWU_Root2026!!
     OR valid X-Staff-Token header.
     """
-    if request.method == "OPTIONS":
-        return
-
     ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
     ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "SWU_Root2026!!")
     STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
 
     # 1. Check X-Staff-Token header
     if x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
-        return
+        return x_staff_token
 
-    # 2. Check HTTP Basic Authorization header
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Basic "):
-        try:
-            encoded = auth_header.split(" ", 1)[1]
-            decoded = base64.b64decode(encoded).decode("utf-8")
-            if ":" in decoded:
-                username, password = decoded.split(":", 1)
-                if secrets.compare_digest(username, ADMIN_USER) and secrets.compare_digest(password, ADMIN_PASS):
-                    return
-        except Exception:
-            pass
+    # 2. Check HTTP Basic Auth credentials
+    if credentials:
+        user_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
+        pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASS)
+        if user_ok and pass_ok:
+            return credentials.username
 
-    # 3. Reject with HTTP 401 and WWW-Authenticate header to pop up browser login box
+    # 3. Prompt HTTP Basic Auth browser login box
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Unauthorized: Admin credentials (Username: cvrms_prd_service_account / Password) or valid X-Staff-Token required.",
