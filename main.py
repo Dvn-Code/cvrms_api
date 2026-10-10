@@ -92,12 +92,14 @@ class CustomerBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     first_name: str = Field(min_length=1, max_length=50)
+    middle_name: Optional[str] = Field(default=None, max_length=50)
     last_name: str = Field(min_length=1, max_length=50)
     email: Optional[EmailStr] = Field(default=None, max_length=120)
     phone: str = Field(min_length=7, max_length=20)
     address: Optional[str] = Field(default=None, max_length=255)
+    customer_type: Literal["Registered", "Walk-In"] = "Registered"
 
-    @field_validator("first_name", "last_name")
+    @field_validator("first_name", "last_name", "middle_name")
     @classmethod
     def sanitize_names(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
@@ -109,6 +111,17 @@ class CustomerBase(BaseModel):
     def normalize_email(cls, v: Optional[str]) -> Optional[str]:
         return v.lower() if v else None
 
+    @model_validator(mode="after")
+    def validate_customer_completeness(self) -> CustomerBase:
+        if self.customer_type == "Registered":
+            if not self.email or not str(self.email).strip():
+                raise ValueError("Registered customers require an email address.")
+            if not self.phone or not self.phone.strip():
+                raise ValueError("Registered customers require a phone number.")
+            if not self.address or not self.address.strip():
+                raise ValueError("Registered customers require a home address.")
+        return self
+
 
 class CustomerCreate(CustomerBase):
     pass
@@ -119,11 +132,13 @@ class CustomerSyncGoogle(BaseModel):
 
     email: EmailStr
     first_name: str = Field(min_length=1, max_length=50)
+    middle_name: Optional[str] = Field(default=None, max_length=50)
     last_name: str = Field(min_length=1, max_length=50)
     phone: Optional[str] = Field(default="N/A", max_length=20)
     address: Optional[str] = Field(default=None, max_length=255)
+    customer_type: Literal["Registered", "Walk-In"] = "Registered"
 
-    @field_validator("first_name", "last_name")
+    @field_validator("first_name", "last_name", "middle_name")
     @classmethod
     def sanitize_names(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
@@ -149,10 +164,11 @@ class StaffBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     first_name: str = Field(min_length=1, max_length=50)
+    middle_name: Optional[str] = Field(default=None, max_length=50)
     last_name: str = Field(min_length=1, max_length=50)
-    role: str = Field(min_length=2, max_length=50)
+    role: Literal["Front Desk", "Cashier", "Manager", "Admin"] = "Front Desk"
 
-    @field_validator("first_name", "last_name")
+    @field_validator("first_name", "last_name", "middle_name")
     @classmethod
     def sanitize_names(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
@@ -179,7 +195,8 @@ class RoomBase(BaseModel):
     room_number: str = Field(min_length=1, max_length=10)
     rate_per_day: Decimal = Field(ge=Decimal("0.00"), decimal_places=2)
     max_pax: int = Field(gt=0)
-    status: Literal["Available", "Occupied", "Cleaning", "Maintenance"] = "Available"
+    status: Literal["Ready", "Occupied", "Cleaning", "Maintenance"] = "Ready"
+    room_type: Literal["Standard", "Deluxe"] = "Standard"
 
 
 class RoomCreate(RoomBase):
@@ -222,10 +239,11 @@ class BookingBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     customer_id: str = Field(min_length=3, max_length=20)
-    staff_id: str = Field(min_length=3, max_length=10)
+    staff_id: Optional[str] = Field(default=None, max_length=10)
     room_id: Optional[str] = Field(default=None, max_length=10)
+    room_ids: Optional[List[str]] = Field(default=None)
     court_id: Optional[str] = Field(default=None, max_length=10)
-    booking_date: date
+    booking_date: date = Field(default_factory=date.today)
     start_time: Optional[time] = None
     end_time: Optional[time] = None
     check_in_date: Optional[date] = None
@@ -233,23 +251,26 @@ class BookingBase(BaseModel):
     exclusive: bool = False
     paddle_count: int = Field(default=0, ge=0)
     status: Literal["Pending", "Confirmed", "Checked-In", "Completed", "Cancelled"] = "Pending"
+    total_amount: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
 
     @model_validator(mode="after")
     def validate_exclusive_booking_arc(self) -> BookingBase:
-        # Database constraint enforcement: XOR between room_id and court_id
-        has_room = self.room_id is not None and self.room_id.strip() != ""
+        has_rooms = (self.room_ids is not None and len(self.room_ids) > 0) or (self.room_id is not None and self.room_id.strip() != "")
         has_court = self.court_id is not None and self.court_id.strip() != ""
 
-        if not (has_room ^ has_court):
+        if not (has_rooms ^ has_court):
             raise ValueError(
-                "A booking must be assigned to either a Room OR a Sports Court, never both and never neither."
+                "A booking must be assigned to either Accommodation Rooms OR a Sports Court, never both and never neither."
             )
 
-        if has_room and (self.check_in_date is None or self.check_out_date is None):
+        if has_rooms and (self.check_in_date is None or self.check_out_date is None):
             raise ValueError("Room bookings require both check_in_date and check_out_date.")
 
         if has_court and (self.start_time is None or self.end_time is None):
             raise ValueError("Court reservations require both start_time and end_time.")
+
+        if has_rooms and self.paddle_count > 0:
+            raise ValueError("Paddle rentals are only applicable to sports court bookings.")
 
         return self
 
@@ -343,6 +364,7 @@ class POSOrderCreate(BaseModel):
     order_id: str = Field(min_length=3, max_length=15, examples=["ORD-001"])
     customer_id: Optional[str] = Field(default=None, max_length=20)
     staff_id: str = Field(min_length=3, max_length=10)
+    booking_id: Optional[str] = Field(default=None, max_length=15)
     items: List[POSOrderItemCreate] = Field(min_length=1)
 
 
@@ -350,6 +372,7 @@ class POSOrderResponse(BaseModel):
     order_id: str
     customer_id: Optional[str] = None
     staff_id: str
+    booking_id: Optional[str] = None
     order_date: datetime
     total_amount: Decimal
     items: List[POSOrderItemResponse] = []
@@ -1056,155 +1079,134 @@ async def get_booking(booking_id: str):
 )
 async def create_booking(booking: BookingCreate):
     async with acquire_db_connection() as conn:
-        try:
-            # 0. Server-Side Real-Time Past Date & Time Check (Defend against local device clock tampering)
-            today_server = date.today()
-            now_time_server = datetime.now().time()
-            target_date = booking.check_in_date or booking.booking_date
+        async with conn.transaction():
+            try:
+                # 0. Server-Side Real-Time Past Date & Time Check
+                today_server = date.today()
+                now_time_server = datetime.now().time()
+                target_date = booking.check_in_date or booking.booking_date
 
-            if target_date < today_server:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Booking Failure: Cannot create reservations for past dates!"
-                )
-
-            if target_date == today_server and booking.start_time and booking.start_time < now_time_server:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Booking Failure: Cannot reserve time slots that have already passed for today!"
-                )
-
-            # 1. Ensure staff_id exists in resort.staff table
-            await conn.execute(
-                """
-                INSERT INTO resort.staff (staff_id, first_name, last_name, role)
-                VALUES ($1, 'System', 'Staff', 'Receptionist')
-                ON CONFLICT (staff_id) DO NOTHING
-                """,
-                booking.staff_id,
-            )
-
-            # 2. Ensure customer_id exists in resort.customer table
-            await conn.execute(
-                """
-                INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address)
-                VALUES ($1, 'Registered', 'Customer', $2, '09123456789', 'Cebu City')
-                ON CONFLICT (customer_id) DO NOTHING
-                """,
-                booking.customer_id,
-                f"{booking.customer_id.lower()}@casavista.com",
-            )
-
-            # 3. Ensure room_id exists in resort.room table if provided
-            if booking.room_id and booking.room_id.strip():
-                num = booking.room_id.replace("RM-", "")
-                await conn.execute(
-                    """
-                    INSERT INTO resort.room (room_id, room_number, rate_per_day, max_pax, status)
-                    VALUES ($1, $2, 2500.00, 4, 'Available')
-                    ON CONFLICT (room_id) DO NOTHING
-                    """,
-                    booking.room_id,
-                    num,
-                )
-
-            # 4. Ensure court_id exists in resort.court table if provided
-            if booking.court_id and booking.court_id.strip():
-                await conn.execute(
-                    """
-                    INSERT INTO resort.court (court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate)
-                    VALUES ($1::varchar, 'Court ' || $1::varchar, 'Pickleball', 400.00, 600.00, 100.00)
-                    ON CONFLICT (court_id) DO NOTHING
-                    """,
-                    booking.court_id,
-                )
-
-            # 5. Check for overlapping active bookings on the same room or court
-            if booking.room_id and booking.room_id.strip():
-                existing_room = await conn.fetchrow(
-                    """
-                    SELECT booking_id FROM resort.booking
-                    WHERE room_id = $1
-                      AND (
-                          status IN ('Confirmed', 'Checked-In')
-                          OR (status = 'Pending' AND hold_expires_at > CURRENT_TIMESTAMP)
-                      )
-                      AND (
-                          (check_in_date <= $3 AND check_out_date >= $2)
-                          OR booking_date = $2
-                      )
-                    """,
-                    booking.room_id,
-                    booking.check_in_date or booking.booking_date,
-                    booking.check_out_date or booking.booking_date,
-                )
-                if existing_room:
+                if target_date < today_server:
                     raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Double Booking Violation: Room {booking.room_id} is already reserved for the selected dates!"
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Booking Failure: Cannot create reservations for past dates!"
                     )
 
-            if booking.court_id and booking.court_id.strip():
-                existing_court = await conn.fetchrow(
+                if target_date == today_server and booking.start_time and booking.start_time < now_time_server:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Booking Failure: Cannot reserve time slots that have already passed for today!"
+                    )
+
+                # 1. Ensure staff_id exists if provided
+                if booking.staff_id and booking.staff_id.strip():
+                    await conn.execute(
+                        """
+                        INSERT INTO resort.staff (staff_id, first_name, last_name, role)
+                        VALUES ($1, 'System', 'Staff', 'Front Desk')
+                        ON CONFLICT (staff_id) DO NOTHING
+                        """,
+                        booking.staff_id,
+                    )
+
+                # 2. Ensure customer_id exists
+                await conn.execute(
                     """
-                    SELECT booking_id FROM resort.booking
-                    WHERE court_id = $1
-                      AND (
-                          status IN ('Confirmed', 'Checked-In')
-                          OR (status = 'Pending' AND hold_expires_at > CURRENT_TIMESTAMP)
-                      )
-                      AND booking_date = $2
-                      AND (
-                          ($3::time IS NULL OR $4::time IS NULL)
-                          OR (start_time < $4 AND end_time > $3)
-                      )
+                    INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address, customer_type)
+                    VALUES ($1, 'Registered', 'Customer', $2, '09123456789', 'Cebu City', 'Registered')
+                    ON CONFLICT (customer_id) DO NOTHING
                     """,
-                    booking.court_id,
+                    booking.customer_id,
+                    f"{booking.customer_id.lower()}@casavista.com",
+                )
+
+                # Identify room booking vs court booking
+                is_room_booking = booking.check_in_date is not None and booking.check_out_date is not None and (booking.court_id is None or booking.court_id.strip() == "")
+
+                target_rooms = []
+                if is_room_booking:
+                    if booking.room_ids and len(booking.room_ids) > 0:
+                        target_rooms = booking.room_ids
+                    elif booking.room_id and booking.room_id.strip():
+                        target_rooms = [booking.room_id]
+                    else:
+                        target_rooms = ["RM-101"]
+
+                    for r_id in target_rooms:
+                        num = r_id.replace("RM-", "")
+                        await conn.execute(
+                            """
+                            INSERT INTO resort.room (room_id, room_number, rate_per_day, max_pax, status, room_type)
+                            VALUES ($1, $2, 2500.00, 4, 'Ready', 'Standard')
+                            ON CONFLICT (room_id) DO NOTHING
+                            """,
+                            r_id,
+                            num,
+                        )
+
+                # Ensure court_id exists if provided
+                if booking.court_id and booking.court_id.strip():
+                    await conn.execute(
+                        """
+                        INSERT INTO resort.court (court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate)
+                        VALUES ($1::varchar, 'Court ' || $1::varchar, 'Pickleball', 400.00, 600.00, 100.00)
+                        ON CONFLICT (court_id) DO NOTHING
+                        """,
+                        booking.court_id,
+                    )
+
+                # Enforce 15-minute hold auto-calculation & status = 'Pending'
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO resort.booking (
+                        booking_id, customer_id, staff_id, court_id, booking_date,
+                        start_time, end_time, check_in_date, check_out_date, exclusive,
+                        paddle_count, status, created_at, hold_expires_at, total_amount
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5,
+                        $6, $7, $8, $9, $10,
+                        $11, 'Pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '15 minutes', $12
+                    )
+                    RETURNING booking_id, customer_id, staff_id, court_id, booking_date,
+                              start_time, end_time, check_in_date, check_out_date, exclusive,
+                              paddle_count, status, created_at, hold_expires_at, total_amount
+                    """,
+                    booking.booking_id,
+                    booking.customer_id,
+                    booking.staff_id if booking.staff_id and booking.staff_id.strip() else None,
+                    booking.court_id if booking.court_id and booking.court_id.strip() else None,
                     booking.booking_date,
                     booking.start_time,
                     booking.end_time,
+                    booking.check_in_date,
+                    booking.check_out_date,
+                    booking.exclusive,
+                    booking.paddle_count,
+                    booking.total_amount,
                 )
-                if existing_court:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Double Booking Violation: Court {booking.court_id} is already reserved for the selected date and time!"
-                    )
 
-            # Enforce 15-minute hold auto-calculation & status = 'Pending'
-            row = await conn.fetchrow(
-                """
-                INSERT INTO resort.booking (
-                    booking_id, customer_id, staff_id, room_id, court_id, booking_date,
-                    start_time, end_time, check_in_date, check_out_date, exclusive,
-                    paddle_count, status, created_at, hold_expires_at
-                )
-                VALUES (
-                    $1, $2, $3, $4, $5, $6,
-                    $7, $8, $9, $10, $11,
-                    $12, 'Pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '15 minutes'
-                )
-                RETURNING booking_id, customer_id, staff_id, room_id, court_id, booking_date,
-                          start_time, end_time, check_in_date, check_out_date, exclusive,
-                          paddle_count, status, created_at, hold_expires_at
-                """,
-                booking.booking_id,
-                booking.customer_id,
-                booking.staff_id,
-                booking.room_id if booking.room_id and booking.room_id.strip() else None,
-                booking.court_id if booking.court_id and booking.court_id.strip() else None,
-                booking.booking_date,
-                booking.start_time,
-                booking.end_time,
-                booking.check_in_date,
-                booking.check_out_date,
-                booking.exclusive,
-                booking.paddle_count,
-            )
-            return dict(row)
-        except HTTPException:
-            raise
-        except Exception as err:
-            handle_db_exception(err)
+                # If room booking, populate resort.booking_room line items (satisfying ctrg_booking_has_rooms at COMMIT)
+                if is_room_booking:
+                    for r_id in target_rooms:
+                        rate_row = await conn.fetchrow("SELECT rate_per_day FROM resort.room WHERE room_id = $1", r_id)
+                        rate = rate_row["rate_per_day"] if rate_row else Decimal("2500.00")
+                        await conn.execute(
+                            """
+                            INSERT INTO resort.booking_room (booking_id, room_id, rate_per_day)
+                            VALUES ($1, $2, $3)
+                            """,
+                            booking.booking_id,
+                            r_id,
+                            rate,
+                        )
+
+                return dict(row)
+
+            except HTTPException:
+                raise
+            except Exception as err:
+                handle_db_exception(err)
 
 
 @app.put("/bookings/{booking_id}/status", response_model=BookingResponse, tags=["Bookings"])
@@ -1391,13 +1393,14 @@ async def create_pos_order(order: POSOrderCreate):
                 # 3. Insert parent POS order
                 order_row = await conn.fetchrow(
                     """
-                    INSERT INTO pos.pos_order (order_id, customer_id, staff_id, order_date, total_amount)
-                    VALUES ($1, $2, $3, CURRENT_TIMESTAMP, $4)
-                    RETURNING order_id, customer_id, staff_id, order_date, total_amount
+                    INSERT INTO pos.pos_order (order_id, customer_id, staff_id, booking_id, order_date, total_amount)
+                    VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5)
+                    RETURNING order_id, customer_id, staff_id, booking_id, order_date, total_amount
                     """,
                     order.order_id,
                     order.customer_id,
                     order.staff_id,
+                    order.booking_id if order.booking_id and order.booking_id.strip() else None,
                     total_amount,
                 )
 
