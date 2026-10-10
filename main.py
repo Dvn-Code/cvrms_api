@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import random
 import secrets
@@ -15,6 +16,8 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 try:
     from pydantic import EmailStr
@@ -57,12 +60,59 @@ async def lifespan(app: FastAPI):
             pass
 
 
+# =============================================================================
+# GLOBAL HTTP BASIC AUTH & STAFF TOKEN MIDDLEWARE
+# =============================================================================
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        # Allow OPTIONS requests for CORS preflight
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization")
+        staff_header = request.headers.get("X-Staff-Token")
+
+        ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
+        ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "SWU_Root2026!!")
+        STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
+
+        authenticated = False
+
+        if auth_header and auth_header.startswith("Basic "):
+            try:
+                encoded = auth_header.split(" ", 1)[1]
+                decoded = base64.b64decode(encoded).decode("utf-8")
+                if ":" in decoded:
+                    username, password = decoded.split(":", 1)
+                    if secrets.compare_digest(username, ADMIN_USER) and secrets.compare_digest(password, ADMIN_PASS):
+                        authenticated = True
+            except Exception:
+                authenticated = False
+
+        if not authenticated and staff_header and secrets.compare_digest(staff_header, STAFF_SECRET):
+            authenticated = True
+
+        if not authenticated:
+            return Response(
+                content='{"detail": "Unauthorized: Basic Auth (cvrms_prd_service_account / SWU_Root2026!!) or X-Staff-Token required."}',
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": 'Basic realm="CVRMS Protected API"',
+                    "Content-Type": "application/json",
+                },
+            )
+
+        return await call_next(request)
+
+
 app = FastAPI(
     title="Casa Vista Resort Management System (CVRMS) API",
     description="Backend API supporting Resort Accommodations, Sports Amenities, Cashless Payments, and POS Retail Modules.",
     version="2.0.0",
     lifespan=lifespan,
 )
+
+app.add_middleware(BasicAuthMiddleware)
 
 
 @asynccontextmanager
@@ -405,41 +455,6 @@ def handle_db_exception(err: Exception) -> None:
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail=f"Database Error ({type(err).__name__}): {str(err)}",
-    )
-
-
-security = HTTPBasic(auto_error=False)
-
-
-async def verify_staff_token(
-    x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
-    credentials: Optional[HTTPBasicCredentials] = Depends(security),
-):
-    """
-    Guards administrative and editing endpoints.
-    Requires either HTTP Basic Auth (Username: cvrms_prd_service_account / Password: SWU_Root2026!!)
-    OR valid X-Staff-Token header.
-    """
-    ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
-    ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "SWU_Root2026!!")
-    STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
-
-    # 1. Check HTTP Basic Auth credentials
-    if credentials:
-        user_correct = secrets.compare_digest(credentials.username, ADMIN_USER)
-        pass_correct = secrets.compare_digest(credentials.password, ADMIN_PASS)
-        if user_correct and pass_correct:
-            return credentials.username
-
-    # 2. Check X-Staff-Token header
-    if x_staff_token and x_staff_token == STAFF_SECRET:
-        return x_staff_token
-
-    # 3. If neither matches, prompt HTTP Basic Auth
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Unauthorized: Admin credentials (Username: cvrms_prd_service_account / Password) or valid X-Staff-Token required.",
-        headers={"WWW-Authenticate": "Basic realm='CVRMS Administrative API'"},
     )
 
 
