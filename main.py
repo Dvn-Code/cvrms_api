@@ -14,6 +14,10 @@ from typing import List, Literal, Optional, Union
 import asyncpg
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 try:
@@ -58,52 +62,88 @@ async def lifespan(app: FastAPI):
 
 
 # =============================================================================
-# GLOBAL HTTP BASIC AUTH & STAFF TOKEN GUARD
+# AUTHENTICATION GUARDS (BASIC AUTH & STAFF TOKEN)
 # =============================================================================
 security = HTTPBasic(auto_error=False)
+docs_security = HTTPBasic(auto_error=True)
+
+ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
+ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "SWU_Root2026!!")
+STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
+
+
+def verify_swagger_credentials(credentials: HTTPBasicCredentials = Depends(docs_security)):
+    """Guards Swagger UI (/docs, /redoc, /openapi.json) with HTTP Basic Auth."""
+    is_user_valid = secrets.compare_digest(credentials.username, ADMIN_USER)
+    is_pass_valid = secrets.compare_digest(credentials.password, ADMIN_PASS)
+
+    if not (is_user_valid and is_pass_valid):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password.",
+            headers={"WWW-Authenticate": 'Basic realm="CVRMS Protected Swagger Documentation"'},
+        )
+    return credentials.username
 
 
 async def verify_staff_token(
     x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
     credentials: Optional[HTTPBasicCredentials] = Depends(security),
 ):
-    """
-    Guards ALL endpoints globally.
-    Requires either HTTP Basic Auth:
-    Username: cvrms_prd_service_account
-    Password: SWU_Root2026!!
-    OR valid X-Staff-Token header.
-    """
-    ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
-    ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "SWU_Root2026!!")
-    STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
-
-    # 1. Check X-Staff-Token header
+    """Guards admin API endpoints. Accepts either X-Staff-Token or Basic Auth."""
     if x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
         return x_staff_token
 
-    # 2. Check HTTP Basic Auth credentials
     if credentials:
         user_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
         pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASS)
         if user_ok and pass_ok:
             return credentials.username
 
-    # 3. Prompt HTTP Basic Auth browser login box
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Unauthorized: Admin credentials (Username: cvrms_prd_service_account / Password) or valid X-Staff-Token required.",
+        detail="Unauthorized: Admin credentials or valid X-Staff-Token required.",
         headers={"WWW-Authenticate": 'Basic realm="CVRMS Protected API"'},
     )
 
 
+# =============================================================================
+# FASTAPI INSTANCE (SWAGGER DISABLED BY DEFAULT FOR PROTECTION)
+# =============================================================================
 app = FastAPI(
     title="Casa Vista Resort Management System (CVRMS) API",
     description="Backend API supporting Resort Accommodations, Sports Amenities, Cashless Payments, and POS Retail Modules.",
     version="2.0.0",
     lifespan=lifespan,
-    dependencies=[Depends(verify_staff_token)],
+    docs_url=None,       # Handled manually via protected endpoint below
+    redoc_url=None,      # Handled manually via protected endpoint below
+    openapi_url=None,    # Handled manually via protected endpoint below
 )
+
+
+# =============================================================================
+# PROTECTED SWAGGER DOCUMENTATION ENDPOINTS
+# =============================================================================
+@app.get("/docs", include_in_schema=False)
+async def get_swagger_ui(username: str = Depends(verify_swagger_credentials)):
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="CVRMS API - Swagger UI")
+
+
+@app.get("/redoc", include_in_schema=False)
+async def get_redoc_ui(username: str = Depends(verify_swagger_credentials)):
+    return get_redoc_html(openapi_url="/openapi.json", title="CVRMS API - ReDoc")
+
+
+@app.get("/openapi.json", include_in_schema=False)
+async def get_openapi_schema(username: str = Depends(verify_swagger_credentials)):
+    return JSONResponse(
+        get_openapi(
+            title=app.title,
+            version=app.version,
+            routes=app.routes,
+            description=app.description,
+        )
+    )
 
 
 @asynccontextmanager
@@ -345,7 +385,6 @@ class PaymentCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_exclusive_payment_arc(self) -> PaymentCreate:
-        # Database constraint enforcement: XOR between booking_id and order_id
         has_booking = self.booking_id is not None and self.booking_id.strip() != ""
         has_order = self.order_id is not None and self.order_id.strip() != ""
 
@@ -422,10 +461,10 @@ class POSOrderResponse(BaseModel):
 
 
 # =============================================================================
-# REUSABLE DATABASE EXCEPTION DISPATCHER & AUTH GUARDS
+# REUSABLE DATABASE EXCEPTION DISPATCHER
 # =============================================================================
 def handle_db_exception(err: Exception) -> None:
-    """Translates asyncpg database errors into structured, rubric-compliant HTTP exceptions."""
+    """Translates asyncpg database errors into structured HTTP exceptions."""
     print(f"\n>>> [DATABASE ERROR TRIGGERED]: {type(err).__name__} -> {err}\n")
 
     if isinstance(err, asyncpg.UniqueViolationError):
@@ -498,10 +537,6 @@ class VerifyCodeRequest(BaseModel):
     tags=["Authentication"],
 )
 async def send_verification_code(req: SendVerificationCodeRequest):
-    """
-    Generates a 6-digit verification code with 5-minute expiry.
-    Sends code via SMTP if configured, or prints [DEV OTP] to terminal console.
-    """
     email_clean = req.email.lower()
     otp_code = f"{random.randint(100000, 999999):06d}"
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -511,12 +546,6 @@ async def send_verification_code(req: SendVerificationCodeRequest):
         "expires_at": expires_at,
     }
 
-    print(f"\n==================================================")
-    print(f" [DEV OTP GENERATED]: {otp_code} for {email_clean}")
-    print(f" Expires At: {expires_at.isoformat()}")
-    print(f"==================================================\n")
-
-    # Attempt SMTP sending via Google Gmail / Standard SMTP
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_user = os.getenv("SMTP_USER", "")
@@ -538,9 +567,8 @@ async def send_verification_code(req: SendVerificationCodeRequest):
                 server.login(smtp_user, smtp_password)
                 server.send_message(msg)
             email_sent = True
-            print(f"✓ OTP Email successfully dispatched via SMTP to {email_clean}")
         except Exception as err:
-            print(f"Notice: SMTP dispatch failed ({err}). Dev code active: [DEV OTP]: {otp_code}")
+            print(f"Notice: SMTP dispatch failed ({err}). Dev code active: {otp_code}")
 
     return {
         "status": "success",
@@ -556,10 +584,6 @@ async def send_verification_code(req: SendVerificationCodeRequest):
     tags=["Authentication"],
 )
 async def verify_code(req: VerifyCodeRequest):
-    """
-    Verifies the 6-digit OTP code against the verification store.
-    Invalidates code upon successful verification.
-    """
     email_clean = req.email.lower()
     user_code = req.code.strip()
 
@@ -585,7 +609,6 @@ async def verify_code(req: VerifyCodeRequest):
             detail="Invalid or expired code. Please try again.",
         )
 
-    # Code matches! Invalidate so it cannot be reused.
     verification_store.pop(email_clean, None)
 
     return {
@@ -659,17 +682,11 @@ async def create_customer(customer: CustomerCreate):
     tags=["Customers"],
 )
 async def sync_google_customer(customer: CustomerSyncGoogle):
-    """
-    Sync endpoint for Customer account creation and profile updates.
-    Accepts { email, first_name, last_name, phone, address }.
-    Creates customer if missing or UPDATES existing customer details in Supabase!
-    """
     async with acquire_db_connection() as conn:
         try:
             phone_val = customer.phone if customer.phone and customer.phone.strip() else "N/A"
             address_val = customer.address if customer.address and customer.address.strip() else None
 
-            # 1. Update existing customer if email matches
             existing = await conn.fetchrow(
                 """
                 UPDATE resort.customer
@@ -686,7 +703,6 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
             if existing:
                 return dict(existing)
 
-            # 2. Create customer if not present
             try:
                 row = await conn.fetchrow(
                     """
@@ -936,12 +952,6 @@ def calculate_court_price(
     end_time: time = Query(..., description="End time e.g. 10:00"),
     paddle_count: int = Query(default=0, ge=0),
 ):
-    """
-    Calculates dynamic court reservation cost based on time of day and paddle rentals.
-    - Daytime (06:00 - 18:00): Pickleball ₱400/hr, Basketball ₱500/hr
-    - Nighttime (18:00 - 22:00): Pickleball ₱600/hr, Basketball ₱750/hr
-    - Paddle rental: ₱100/paddle
-    """
     if start_time >= end_time:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -980,9 +990,6 @@ async def get_court_availability(
     court_id: str,
     booking_date: date = Query(default_factory=date.today, description="Booking date (YYYY-MM-DD)"),
 ):
-    """
-    Returns all active holds (Pending with hold_expires_at > NOW()) and confirmed reservations for a court on a date.
-    """
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
             """
@@ -1069,9 +1076,6 @@ async def get_bookings(status_filter: Optional[str] = Query(default=None, alias=
 
 @app.get("/bookings/active", response_model=List[BookingResponse], tags=["Bookings"])
 async def get_active_bookings():
-    """
-    Returns all currently active bookings: Confirmed, Checked-In, or Pending holds that have not expired.
-    """
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
             """
@@ -1115,7 +1119,6 @@ async def create_booking(booking: BookingCreate):
     async with acquire_db_connection() as conn:
         async with conn.transaction():
             try:
-                # 0. Server-Side Real-Time Past Date & Time Check
                 today_server = date.today()
                 now_time_server = datetime.now().time()
                 target_date = booking.check_in_date or booking.booking_date
@@ -1132,7 +1135,6 @@ async def create_booking(booking: BookingCreate):
                         detail="Booking Failure: Cannot reserve time slots that have already passed for today!"
                     )
 
-                # 1. Ensure staff_id exists if provided
                 if booking.staff_id and booking.staff_id.strip():
                     await conn.execute(
                         """
@@ -1143,7 +1145,6 @@ async def create_booking(booking: BookingCreate):
                         booking.staff_id,
                     )
 
-                # 2. Ensure customer_id exists
                 await conn.execute(
                     """
                     INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address, customer_type)
@@ -1154,7 +1155,6 @@ async def create_booking(booking: BookingCreate):
                     f"{booking.customer_id.lower()}@casavista.com",
                 )
 
-                # Identify room booking vs court booking
                 is_room_booking = booking.check_in_date is not None and booking.check_out_date is not None and (booking.court_id is None or booking.court_id.strip() == "")
 
                 target_rooms = []
@@ -1178,7 +1178,6 @@ async def create_booking(booking: BookingCreate):
                             num,
                         )
 
-                # Ensure court_id exists if provided
                 if booking.court_id and booking.court_id.strip():
                     await conn.execute(
                         """
@@ -1189,7 +1188,6 @@ async def create_booking(booking: BookingCreate):
                         booking.court_id,
                     )
 
-                # Enforce 15-minute hold auto-calculation & status = 'Pending'
                 row = await conn.fetchrow(
                     """
                     INSERT INTO resort.booking (
@@ -1220,7 +1218,6 @@ async def create_booking(booking: BookingCreate):
                     booking.total_amount,
                 )
 
-                # If room booking, populate resort.booking_room line items (satisfying ctrg_booking_has_rooms at COMMIT)
                 if is_room_booking:
                     for r_id in target_rooms:
                         rate_row = await conn.fetchrow("SELECT rate_per_day FROM resort.room WHERE room_id = $1", r_id)
@@ -1286,7 +1283,6 @@ async def process_payment(payment: PaymentCreate):
     async with acquire_db_connection() as conn:
         async with conn.transaction():
             try:
-                # Enforce 24-hour non-cancellation refund business rule
                 if payment.payment_type == "Refund" and payment.booking_id:
                     booking = await conn.fetchrow(
                         """
@@ -1301,7 +1297,6 @@ async def process_payment(payment: PaymentCreate):
                             detail="Target booking for refund not found.",
                         )
 
-                    # Compute scheduled reservation start
                     sched_date = booking["check_in_date"] or date.today()
                     sched_time = booking["start_time"] or time(14, 0)
                     sched_dt = datetime.combine(sched_date, sched_time)
@@ -1326,7 +1321,6 @@ async def process_payment(payment: PaymentCreate):
                     payment.payment_type,
                 )
 
-                # Captured full payments automatically flip the linked booking status from 'Pending' to 'Confirmed'
                 if payment.booking_id and payment.booking_id.strip() and payment.payment_type == "Payment":
                     await conn.execute(
                         """
@@ -1397,10 +1391,8 @@ async def create_pos_item(item: POSItemCreate):
 )
 async def create_pos_order(order: POSOrderCreate):
     async with acquire_db_connection() as conn:
-        # Atomic database transaction: order header and line items succeed or fail together
         async with conn.transaction():
             try:
-                # 1. Fetch catalog unit prices and verify existence
                 item_ids = [i.item_id for i in order.items]
                 price_rows = await conn.fetch(
                     "SELECT item_id, price FROM pos.pos_item WHERE item_id = ANY($1::varchar[])",
@@ -1415,7 +1407,6 @@ async def create_pos_order(order: POSOrderCreate):
                         detail=f"POS Items not found: {', '.join(missing)}",
                     )
 
-                # 2. Compute line subtotals and frozen total_amount
                 total_amount = Decimal("0.00")
                 line_items_data = []
                 for item in order.items:
@@ -1424,7 +1415,6 @@ async def create_pos_order(order: POSOrderCreate):
                     total_amount += subtotal
                     line_items_data.append((order.order_id, item.item_id, item.quantity, subtotal))
 
-                # 3. Insert parent POS order
                 order_row = await conn.fetchrow(
                     """
                     INSERT INTO pos.pos_order (order_id, customer_id, staff_id, booking_id, order_date, total_amount)
@@ -1438,7 +1428,6 @@ async def create_pos_order(order: POSOrderCreate):
                     total_amount,
                 )
 
-                # 4. Bulk insert line items into bridge table
                 inserted_items = []
                 for item_record in line_items_data:
                     item_row = await conn.fetchrow(
@@ -1500,10 +1489,6 @@ async def get_pos_order(order_id: str):
 # =============================================================================
 @app.get("/reports/active-bookings-detail", tags=["Relational Reports"])
 async def report_active_bookings():
-    """
-    Demonstrates multi-table INNER and LEFT JOINs across resort schemas.
-    Reconciles Customer identity, Assigned Staff, and Room/Court details.
-    """
     query = """
         SELECT 
             b.booking_id,
@@ -1534,10 +1519,6 @@ async def report_active_bookings():
 
 @app.get("/reports/room-occupancy-audit", tags=["Relational Reports"])
 async def report_room_occupancy():
-    """
-    Demonstrates LEFT JOIN between physical Room inventory and active Bookings.
-    Provides housekeeping status and current guest allocation.
-    """
     query = """
         SELECT 
             r.room_id,
@@ -1561,10 +1542,6 @@ async def report_room_occupancy():
 
 @app.get("/reports/pos-sales-ledger", tags=["Relational Reports"])
 async def report_pos_sales():
-    """
-    Demonstrates cross-schema joins between pos and resort.
-    Unwinds pos_order, pos_order_item, pos_item, staff, and customer.
-    """
     query = """
         SELECT 
             o.order_id,
@@ -1591,10 +1568,6 @@ async def report_pos_sales():
 
 @app.get("/reports/financial-payments-audit", tags=["Relational Reports"])
 async def report_financial_payments():
-    """
-    Demonstrates verification of the XOR exclusive arc for all captured payments.
-    Joins payments with their parent Booking or parent POS Order.
-    """
     query = """
         SELECT 
             p.payment_id,
@@ -1632,37 +1605,28 @@ async def get_revenue_pnl_summary(
     start_date: Optional[date] = Query(default=None, description="Filter from date (YYYY-MM-DD)"),
     end_date: Optional[date] = Query(default=None, description="Filter to date (YYYY-MM-DD)"),
 ):
-    """
-    Computes real-time Profit & Loss / Revenue analytics directly from the payment ledger.
-    Calculates Gross Room/Court Revenue, Gross POS Sales, Refund Deductions, and Net Revenue.
-    """
     query = """
         SELECT 
-            -- Total Gross Bookings (Room & Sports Courts)
             COALESCE(SUM(CASE 
                 WHEN p.booking_id IS NOT NULL AND p.payment_type = 'Payment' THEN p.amount 
                 ELSE 0 
             END), 0) AS gross_booking_revenue,
 
-            -- Total Gross POS Sales (Food, Drinks, Retail)
             COALESCE(SUM(CASE 
                 WHEN p.order_id IS NOT NULL AND p.payment_type = 'Payment' THEN p.amount 
                 ELSE 0 
             END), 0) AS gross_pos_revenue,
 
-            -- Total Processed Refunds
             COALESCE(SUM(CASE 
                 WHEN p.payment_type = 'Refund' THEN p.amount 
                 ELSE 0 
             END), 0) AS total_refunds,
 
-            -- Total Captured Payments (Gross Inflow)
             COALESCE(SUM(CASE 
                 WHEN p.payment_type = 'Payment' THEN p.amount 
                 ELSE 0 
             END), 0) AS total_gross_revenue,
 
-            -- Net Revenue (Inflow minus Outflow)
             COALESCE(SUM(CASE 
                 WHEN p.payment_type = 'Payment' THEN p.amount 
                 WHEN p.payment_type = 'Refund' THEN -p.amount 
