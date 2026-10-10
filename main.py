@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import secrets
 import smtplib
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
@@ -12,6 +13,7 @@ from typing import List, Literal, Optional, Union
 import asyncpg
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 try:
@@ -406,21 +408,39 @@ def handle_db_exception(err: Exception) -> None:
     )
 
 
+security = HTTPBasic(auto_error=False)
+
+
 async def verify_staff_token(
-    x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token")
+    x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
+    credentials: Optional[HTTPBasicCredentials] = Depends(security),
 ):
     """
-    Guards administrative and analytical endpoints.
-    Returns HTTP 401 Unauthorized if the client omits or supplies an invalid token.
+    Guards administrative and editing endpoints.
+    Requires either HTTP Basic Auth (Username: cvrms_prd_service_account / Password: SWU_Root2026!!)
+    OR valid X-Staff-Token header.
     """
+    ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
+    ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "SWU_Root2026!!")
     STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
-    if not x_staff_token or x_staff_token != STAFF_SECRET:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: Valid X-Staff-Token header is required to access this resource.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return x_staff_token
+
+    # 1. Check HTTP Basic Auth credentials
+    if credentials:
+        user_correct = secrets.compare_digest(credentials.username, ADMIN_USER)
+        pass_correct = secrets.compare_digest(credentials.password, ADMIN_PASS)
+        if user_correct and pass_correct:
+            return credentials.username
+
+    # 2. Check X-Staff-Token header
+    if x_staff_token and x_staff_token == STAFF_SECRET:
+        return x_staff_token
+
+    # 3. If neither matches, prompt HTTP Basic Auth
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized: Admin credentials (Username: cvrms_prd_service_account / Password) or valid X-Staff-Token required.",
+        headers={"WWW-Authenticate": "Basic realm='CVRMS Administrative API'"},
+    )
 
 
 # =============================================================================
@@ -695,7 +715,12 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
             handle_db_exception(err)
 
 
-@app.put("/customers/{customer_id}", response_model=CustomerResponse, tags=["Customers"])
+@app.put(
+    "/customers/{customer_id}",
+    response_model=CustomerResponse,
+    tags=["Customers"],
+    dependencies=[Depends(verify_staff_token)],
+)
 async def update_customer(customer_id: str, customer: CustomerUpdate):
     async with acquire_db_connection() as conn:
         try:
@@ -723,7 +748,10 @@ async def update_customer(customer_id: str, customer: CustomerUpdate):
 
 
 @app.delete(
-    "/customers/{customer_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Customers"]
+    "/customers/{customer_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Customers"],
+    dependencies=[Depends(verify_staff_token)],
 )
 async def delete_customer(customer_id: str):
     async with acquire_db_connection() as conn:
