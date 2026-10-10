@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
 docs_security = HTTPBasic(auto_error=True)
 
 ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
-ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "Wilchin123")
+ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "@Guest12345")
 STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
 
 
