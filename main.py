@@ -468,25 +468,35 @@ class POSOrderResponse(BaseModel):
 # EXCEPTION DISPATCHER
 # =============================================================================
 def handle_db_exception(err: Exception) -> None:
-    print(f"\n>>> [DATABASE ERROR]: {type(err).__name__} -> {err}\n")
+    print(f"\n>>> [DATABASE ERROR CAUGHT]: {type(err).__name__} -> {err}\n")
+
+    if isinstance(err, asyncpg.ExclusionViolationError):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="ERR-409-ROOM-COLLISION: Sorry, this suite or sports court is already reserved for your selected dates/time. Please select a different date range or facility."
+        )
+
     if isinstance(err, asyncpg.UniqueViolationError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Resource conflict: {err.detail or 'A duplicate entry violates a UNIQUE constraint.'}",
+            detail="ERR-409-DUPLICATE: Sorry, a reservation or record with this reference ID already exists in the system."
         )
+
     if isinstance(err, asyncpg.ForeignKeyViolationError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Foreign key constraint failed: {err.detail or 'Referenced parent key does not exist.'}",
+            detail="ERR-400-INVALID-REF: Sorry, the referenced customer, staff, room, or court ID was not found."
         )
+
     if isinstance(err, asyncpg.CheckViolationError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Business rule violation: {err.detail or 'Operation failed a database CHECK constraint.'}",
+            detail="ERR-400-RULE-VIOLATION: Sorry, your request violates resort booking policies (e.g. invalid stay dates or capacity limit)."
         )
+
     raise HTTPException(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail=f"Database Error ({type(err).__name__}): {str(err)}",
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"ERR-400-SYSTEM-ISSUE: Reservation request failed. ({type(err).__name__})"
     )
 
 
