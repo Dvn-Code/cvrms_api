@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import random
 import secrets
@@ -26,6 +27,9 @@ except Exception:
     EmailStr = str
 
 load_dotenv()
+
+# Philippine Standard Time (UTC+8) for accurate local resort date/time checks
+PH_TZ = timezone(timedelta(hours=8))
 
 # =============================================================================
 # DATABASE CONFIGURATION (NO HARDCODED DB PASSWORDS)
@@ -73,7 +77,7 @@ STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
 
 
 def verify_swagger_credentials(credentials: HTTPBasicCredentials = Depends(docs_security)):
-    """Browser basic auth guard protecting /docs and /redoc[cite: 4]."""
+    """Browser basic auth guard protecting /docs and /redoc."""
     is_user_valid = secrets.compare_digest(credentials.username, ADMIN_USER)
     is_pass_valid = secrets.compare_digest(credentials.password, ADMIN_PASS)
 
@@ -91,8 +95,8 @@ async def verify_staff_token(
     x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
 ):
     """
-    Staff guard that checks X-Staff-Token or Authorization headers directly[cite: 4].
-    Does NOT register an OpenAPI security scheme, keeping Swagger UI free of the green lock[cite: 4].
+    Staff guard that checks X-Staff-Token or Authorization headers directly.
+    Does NOT register an OpenAPI security scheme, keeping Swagger UI free of the green lock.
     """
     if x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
         return x_staff_token
@@ -113,6 +117,12 @@ async def verify_staff_token(
         detail="Unauthorized: Admin credentials or valid X-Staff-Token required.",
         headers={"WWW-Authenticate": 'Basic realm="CVRMS Protected API"'},
     )
+
+
+def generate_short_customer_id(seed: str) -> str:
+    """Generates a deterministic 10-character customer_id (e.g. C-8F3A1B2C) that fits VARCHAR(10)."""
+    digest = hashlib.md5(seed.strip().lower().encode("utf-8")).hexdigest()[:8].upper()
+    return f"C-{digest}"
 
 
 # =============================================================================
@@ -317,12 +327,13 @@ class CourtResponse(CourtBase):
 class BookingBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    customer_id: str = Field(min_length=3, max_length=20)
+    customer_id: str = Field(min_length=3, max_length=120)
+    customer_email: Optional[str] = Field(default=None, max_length=120)
     staff_id: Optional[str] = Field(default=None, max_length=10)
     room_id: Optional[str] = Field(default=None, max_length=10)
     room_ids: Optional[List[str]] = Field(default=None)
     court_id: Optional[str] = Field(default=None, max_length=10)
-    booking_date: date = Field(default_factory=date.today)
+    booking_date: date = Field(default_factory=lambda: datetime.now(PH_TZ).date())
     start_time: Optional[time] = None
     end_time: Optional[time] = None
     check_in_date: Optional[date] = None
@@ -362,6 +373,7 @@ class BookingResponse(BaseModel):
 
     booking_id: str
     customer_id: str
+    customer_email: Optional[str] = None
     staff_id: Optional[str] = None
     court_id: Optional[str] = None
     room_id: Optional[str] = None
@@ -470,6 +482,13 @@ class POSOrderResponse(BaseModel):
 def handle_db_exception(err: Exception) -> None:
     print(f"\n>>> [DATABASE ERROR CAUGHT]: {type(err).__name__} -> {err}\n")
 
+    err_msg = str(err)
+    if "Exclusive booking blocked" in err_msg or "Court booking blocked" in err_msg:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"ERR-409-COLLISION: {err_msg}"
+        )
+
     if isinstance(err, asyncpg.ExclusionViolationError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -496,7 +515,7 @@ def handle_db_exception(err: Exception) -> None:
 
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"ERR-400-SYSTEM-ISSUE: Reservation request failed. ({type(err).__name__})"
+        detail=f"ERR-400-SYSTEM-ISSUE: Reservation request failed. ({type(err).__name__}: {err_msg})"
     )
 
 
@@ -641,12 +660,20 @@ async def get_customer(customer_id: str):
 async def create_customer(customer: CustomerCreate):
     async with acquire_db_connection() as conn:
         try:
+            cust_id = generate_short_customer_id(customer.email or f"{customer.first_name}-{customer.phone}")
             row = await conn.fetchrow(
                 """
-                INSERT INTO resort.customer (first_name, middle_name, last_name, email, phone, address, customer_type)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (email) DO UPDATE
+                SET first_name = EXCLUDED.first_name,
+                    middle_name = COALESCE(EXCLUDED.middle_name, resort.customer.middle_name),
+                    last_name = EXCLUDED.last_name,
+                    phone = EXCLUDED.phone,
+                    address = COALESCE(EXCLUDED.address, resort.customer.address)
                 RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
                 """,
+                cust_id,
                 customer.first_name,
                 customer.middle_name,
                 customer.last_name,
@@ -669,13 +696,17 @@ async def create_customer(customer: CustomerCreate):
 async def sync_google_customer(customer: CustomerSyncGoogle):
     async with acquire_db_connection() as conn:
         try:
-            phone_val = customer.phone if customer.phone and customer.phone.strip() else "N/A"
-            address_val = customer.address if customer.address and customer.address.strip() else "N/A"
+            phone_val = customer.phone if customer.phone and customer.phone.strip() else "09123456789"
+            address_val = customer.address if customer.address and customer.address.strip() else "Cebu City"
 
             existing = await conn.fetchrow(
                 """
                 UPDATE resort.customer
-                SET first_name = $1, middle_name = COALESCE($2, middle_name), last_name = $3, phone = $4, address = COALESCE($5, address)
+                SET first_name = $1,
+                    middle_name = COALESCE($2, middle_name),
+                    last_name = $3,
+                    phone = CASE WHEN $4 = 'N/A' THEN phone ELSE $4 END,
+                    address = CASE WHEN $5 = 'N/A' OR $5 IS NULL THEN address ELSE $5 END
                 WHERE LOWER(email) = LOWER($6)
                 RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
                 """,
@@ -689,16 +720,22 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
             if existing:
                 return dict(existing)
 
+            cust_id = generate_short_customer_id(str(customer.email))
             row = await conn.fetchrow(
                 """
-                INSERT INTO resort.customer (first_name, middle_name, last_name, email, phone, address, customer_type)
-                VALUES ($1, $2, $3, $4, $5, $6, 'Registered')
+                INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'Registered')
+                ON CONFLICT (customer_id) DO UPDATE
+                SET first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    email = EXCLUDED.email
                 RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
                 """,
+                cust_id,
                 customer.first_name,
                 customer.middle_name,
                 customer.last_name,
-                customer.email,
+                str(customer.email).lower().strip(),
                 phone_val,
                 address_val,
             )
@@ -953,7 +990,7 @@ def calculate_court_price(
 @app.get("/courts/{court_id}/availability", tags=["Courts"])
 async def get_court_availability(
     court_id: str,
-    booking_date: date = Query(default_factory=date.today, description="Booking date (YYYY-MM-DD)"),
+    booking_date: date = Query(default_factory=lambda: datetime.now(PH_TZ).date(), description="Booking date (YYYY-MM-DD)"),
 ):
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
@@ -1015,7 +1052,7 @@ async def create_court(court: CourtCreate):
 async def get_bookings(status_filter: Optional[str] = Query(default=None, alias="status")):
     base_query = """
         SELECT 
-            b.booking_id, b.customer_id, b.staff_id, b.court_id, b.booking_date,
+            b.booking_id, b.customer_id, c.email AS customer_email, b.staff_id, b.court_id, b.booking_date,
             b.start_time, b.end_time, b.check_in_date, b.check_out_date, b.exclusive,
             b.paddle_count, b.status, b.created_at, b.hold_expires_at, b.total_amount,
             COALESCE(
@@ -1023,6 +1060,7 @@ async def get_bookings(status_filter: Optional[str] = Query(default=None, alias=
                 ARRAY[]::varchar[]
             ) AS room_ids
         FROM resort.booking b
+        LEFT JOIN resort.customer c ON b.customer_id = c.customer_id
     """
     async with acquire_db_connection() as conn:
         if status_filter:
@@ -1044,7 +1082,7 @@ async def get_bookings(status_filter: Optional[str] = Query(default=None, alias=
 async def get_active_bookings():
     query = """
         SELECT 
-            b.booking_id, b.customer_id, b.staff_id, b.court_id, b.booking_date,
+            b.booking_id, b.customer_id, c.email AS customer_email, b.staff_id, b.court_id, b.booking_date,
             b.start_time, b.end_time, b.check_in_date, b.check_out_date, b.exclusive,
             b.paddle_count, b.status, b.created_at, b.hold_expires_at, b.total_amount,
             COALESCE(
@@ -1052,6 +1090,7 @@ async def get_active_bookings():
                 ARRAY[]::varchar[]
             ) AS room_ids
         FROM resort.booking b
+        LEFT JOIN resort.customer c ON b.customer_id = c.customer_id
         WHERE b.status IN ('Confirmed', 'Checked-In')
            OR (b.status = 'Pending' AND b.hold_expires_at > CURRENT_TIMESTAMP)
         ORDER BY b.created_at DESC
@@ -1072,7 +1111,7 @@ async def get_active_bookings():
 async def get_booking(booking_id: str):
     query = """
         SELECT 
-            b.booking_id, b.customer_id, b.staff_id, b.court_id, b.booking_date,
+            b.booking_id, b.customer_id, c.email AS customer_email, b.staff_id, b.court_id, b.booking_date,
             b.start_time, b.end_time, b.check_in_date, b.check_out_date, b.exclusive,
             b.paddle_count, b.status, b.created_at, b.hold_expires_at, b.total_amount,
             COALESCE(
@@ -1080,6 +1119,7 @@ async def get_booking(booking_id: str):
                 ARRAY[]::varchar[]
             ) AS room_ids
         FROM resort.booking b
+        LEFT JOIN resort.customer c ON b.customer_id = c.customer_id
         WHERE b.booking_id = $1
     """
     async with acquire_db_connection() as conn:
@@ -1103,8 +1143,9 @@ async def create_booking(booking: BookingCreate):
     async with acquire_db_connection() as conn:
         async with conn.transaction():
             try:
-                today_server = date.today()
-                now_time_server = datetime.now().time()
+                now_ph = datetime.now(PH_TZ)
+                today_server = now_ph.date()
+                now_time_server = now_ph.time()
                 target_date = booking.check_in_date or booking.booking_date
 
                 if target_date < today_server:
@@ -1119,30 +1160,57 @@ async def create_booking(booking: BookingCreate):
                         detail="Booking Failure: Cannot reserve time slots that have already passed for today!",
                     )
 
-                if booking.staff_id and booking.staff_id.strip():
+                # Resolve Staff ID safely (fits VARCHAR(10))
+                staff_id_val = booking.staff_id.strip()[:10] if booking.staff_id and booking.staff_id.strip() else None
+                if staff_id_val:
                     await conn.execute(
                         """
                         INSERT INTO resort.staff (staff_id, first_name, last_name, role)
                         VALUES ($1, 'Front Desk', 'Staff', 'Front Desk')
                         ON CONFLICT (staff_id) DO NOTHING
                         """,
-                        booking.staff_id,
+                        staff_id_val,
                     )
 
-                await conn.execute(
-                    """
-                    INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address, customer_type)
-                    VALUES ($1, 'Registered', 'Customer', $2, '09123456789', 'Cebu City', 'Registered')
-                    ON CONFLICT (customer_id) DO NOTHING
-                    """,
-                    booking.customer_id,
-                    f"{booking.customer_id.lower()}@casavista.com",
+                # Resolve Customer ID and Email safely (fits VARCHAR(10))
+                raw_cust = booking.customer_id.strip()
+                raw_email = (
+                    booking.customer_email.strip().lower()
+                    if booking.customer_email and booking.customer_email.strip()
+                    else (raw_cust.lower() if "@" in raw_cust else f"{raw_cust.lower()}@casavista.com")
                 )
+
+                existing_cust = await conn.fetchrow(
+                    """
+                    SELECT customer_id, email
+                    FROM resort.customer
+                    WHERE customer_id = $1 OR LOWER(email) = LOWER($2)
+                    LIMIT 1
+                    """,
+                    raw_cust[:10],
+                    raw_email,
+                )
+
+                if existing_cust:
+                    resolved_customer_id = existing_cust["customer_id"]
+                    resolved_customer_email = existing_cust["email"] or raw_email
+                else:
+                    resolved_customer_id = raw_cust if (len(raw_cust) <= 10 and "@" not in raw_cust) else generate_short_customer_id(raw_email)
+                    resolved_customer_email = raw_email
+                    await conn.execute(
+                        """
+                        INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address, customer_type)
+                        VALUES ($1, 'Registered', 'Customer', $2, '09123456789', 'Cebu City', 'Registered')
+                        ON CONFLICT (customer_id) DO NOTHING
+                        """,
+                        resolved_customer_id,
+                        resolved_customer_email,
+                    )
 
                 is_room_booking = booking.check_in_date is not None and booking.check_out_date is not None
 
-                # Enforce chk_booking_shape constraint at database level[cite: 3]
-                court_id_val = None if is_room_booking else (booking.court_id if booking.court_id and booking.court_id.strip() else None)
+                # Enforce chk_booking_shape constraint at database level
+                court_id_val = None if is_room_booking else (booking.court_id.strip()[:10] if booking.court_id and booking.court_id.strip() else None)
                 start_time_val = None if is_room_booking else booking.start_time
                 end_time_val = None if is_room_booking else booking.end_time
                 check_in_val = booking.check_in_date if is_room_booking else None
@@ -1152,9 +1220,9 @@ async def create_booking(booking: BookingCreate):
                 target_rooms: List[str] = []
                 if is_room_booking:
                     if booking.room_ids and len(booking.room_ids) > 0:
-                        target_rooms = booking.room_ids
+                        target_rooms = [r.strip()[:10] for r in booking.room_ids if r and r.strip()]
                     elif booking.room_id and booking.room_id.strip():
-                        target_rooms = [booking.room_id]
+                        target_rooms = [booking.room_id.strip()[:10]]
                     else:
                         target_rooms = ["RM-101"]
 
@@ -1171,14 +1239,50 @@ async def create_booking(booking: BookingCreate):
                         )
 
                 if court_id_val:
+                    is_basketball = "BK" in court_id_val.upper() or "BASKET" in court_id_val.upper()
+                    c_type = "Basketball" if is_basketball else "Pickleball"
+                    c_name = "Basketball Half-Court" if is_basketball else f"Court {court_id_val}"
+                    c_day_rate = Decimal("500.00") if is_basketball else Decimal("400.00")
+                    c_night_rate = Decimal("750.00") if is_basketball else Decimal("600.00")
+                    c_paddle_rate = Decimal("0.00") if is_basketball else Decimal("100.00")
+
+                    # Separate parameters ($1..$6) avoid asyncpg AmbiguousParameterError
                     await conn.execute(
                         """
                         INSERT INTO resort.court (court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate)
-                        VALUES ($1, 'Court ' || $1, 'Pickleball', 400.00, 600.00, 100.00)
+                        VALUES ($1, $2, $3, $4, $5, $6)
                         ON CONFLICT (court_id) DO NOTHING
                         """,
                         court_id_val,
+                        c_name,
+                        c_type,
+                        c_day_rate,
+                        c_night_rate,
+                        c_paddle_rate,
                     )
+
+                    # Check for overlapping active court bookings on the same court, date, and time window
+                    collision = await conn.fetchrow(
+                        """
+                        SELECT booking_id
+                        FROM resort.booking
+                        WHERE court_id = $1
+                          AND booking_date = $2
+                          AND status <> 'Cancelled'
+                          AND start_time < $4
+                          AND end_time > $3
+                        LIMIT 1
+                        """,
+                        court_id_val,
+                        booking.booking_date,
+                        start_time_val,
+                        end_time_val,
+                    )
+                    if collision:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="ERR-409-COURT-COLLISION: Sorry, this time slot is already reserved on this court. Please select a different time slot or court.",
+                        )
 
                 row = await conn.fetchrow(
                     """
@@ -1197,8 +1301,8 @@ async def create_booking(booking: BookingCreate):
                               paddle_count, status, created_at, hold_expires_at, total_amount
                     """,
                     booking.booking_id,
-                    booking.customer_id,
-                    booking.staff_id if booking.staff_id and booking.staff_id.strip() else None,
+                    resolved_customer_id,
+                    staff_id_val,
                     court_id_val,
                     booking.booking_date,
                     start_time_val,
@@ -1225,6 +1329,7 @@ async def create_booking(booking: BookingCreate):
                         )
 
                 item = dict(row)
+                item["customer_email"] = resolved_customer_email
                 item["room_ids"] = target_rooms if is_room_booking else []
                 item["room_id"] = target_rooms[0] if (is_room_booking and target_rooms) else None
                 return item
@@ -1257,10 +1362,12 @@ async def update_booking_status(
             if row is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
 
+            cust_row = await conn.fetchrow("SELECT email FROM resort.customer WHERE customer_id = $1", row["customer_id"])
             room_rows = await conn.fetch("SELECT room_id FROM resort.booking_room WHERE booking_id = $1", booking_id)
             r_ids = [r["room_id"] for r in room_rows]
 
             item = dict(row)
+            item["customer_email"] = cust_row["email"] if cust_row else None
             item["room_ids"] = r_ids
             item["room_id"] = r_ids[0] if r_ids else None
             return item
@@ -1297,11 +1404,11 @@ async def process_payment(payment: PaymentCreate):
                             detail="Target booking for refund not found.",
                         )
 
-                    sched_date = booking["check_in_date"] or date.today()
+                    sched_date = booking["check_in_date"] or datetime.now(PH_TZ).date()
                     sched_time = booking["start_time"] or time(14, 0)
                     sched_dt = datetime.combine(sched_date, sched_time)
 
-                    if (sched_dt - datetime.now()).total_seconds() < 86400:
+                    if (sched_dt - datetime.now(PH_TZ).replace(tzinfo=None)).total_seconds() < 86400:
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Cancellations requested within 24 hours of check-in are strictly non-refundable.",
@@ -1455,7 +1562,7 @@ async def get_pos_order(order_id: str):
     async with acquire_db_connection() as conn:
         order_row = await conn.fetchrow(
             """
-            SELECT order_id, customer_id, staff_id, order_date, total_amount
+            SELECT order_id, customer_id, staff_id, booking_id, order_date, total_amount
             FROM pos.pos_order
             WHERE order_id = $1
             """,
