@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from email.mime.text import MIMEText
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import asyncpg
 from dotenv import load_dotenv
@@ -39,34 +39,71 @@ DB_NAME = os.getenv("DB_NAME", "postgres")
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 
-def hash_password(password: str, salt: Optional[str] = None) -> str:
+# =============================================================================
+# COMPACT PASSWORD HASHING & ADDRESS METADATA PACKING (NO DDL REQUIRED)
+# =============================================================================
+AUTH_DELIM = " ||CVAUTH:"
+
+
+def hash_password_compact(password: str, salt: Optional[str] = None) -> str:
     if not salt:
-        salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000)
-    return f"{salt}${dk.hex()}"
+        salt = secrets.token_hex(6)  # 12 chars
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 50000).hex()[:32]
+    return f"{salt}${dk}"
 
 
-def verify_password(plain_password: str, stored_hash: str) -> bool:
+def verify_password_compact(plain_password: str, stored_hash: str) -> bool:
     if not stored_hash or "$" not in stored_hash:
         return False
     salt, _ = stored_hash.split("$", 1)
-    expected = hash_password(plain_password, salt)
+    expected = hash_password_compact(plain_password, salt)
     return secrets.compare_digest(expected, stored_hash)
 
 
-async def ensure_auth_schema(conn: asyncpg.Connection):
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS resort.customer_auth (
-            customer_id VARCHAR(10) PRIMARY KEY REFERENCES resort.customer(customer_id) ON DELETE CASCADE,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            birthdate VARCHAR(20),
-            gender VARCHAR(20),
-            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        """
-    )
+def pack_address_with_auth(
+    clean_address: Optional[str],
+    username: Optional[str] = None,
+    pwd_hash: Optional[str] = None,
+    birthdate: Optional[str] = None,
+    gender: Optional[str] = None,
+) -> str:
+    base_addr = (clean_address or "Cebu City").split(AUTH_DELIM)[0].strip()
+    if not username and not pwd_hash and not birthdate and not gender:
+        return base_addr[:255]
+
+    u_str = (username or "").replace("|", "").strip()[:30]
+    p_str = (pwd_hash or "").replace("|", "").strip()
+    b_str = (birthdate or "").replace("|", "").strip()[:15]
+    g_str = (gender or "").replace("|", "").strip()[:15]
+
+    meta = f"{AUTH_DELIM}{u_str}|{p_str}|{b_str}|{g_str}"
+    max_addr_len = max(10, 255 - len(meta))
+    return f"{base_addr[:max_addr_len]}{meta}"
+
+
+def unpack_address_and_auth(raw_address: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    if not raw_address:
+        return None, None, None, None, None
+    if AUTH_DELIM not in raw_address:
+        return raw_address, None, None, None, None
+
+    clean_addr, meta = raw_address.split(AUTH_DELIM, 1)
+    parts = meta.split("|")
+    username = parts[0] if len(parts) > 0 and parts[0] else None
+    pwd_hash = parts[1] if len(parts) > 1 and parts[1] else None
+    birthdate = parts[2] if len(parts) > 2 and parts[2] else None
+    gender = parts[3] if len(parts) > 3 and parts[3] else None
+    return clean_addr.strip(), username, pwd_hash, birthdate, gender
+
+
+def format_customer_row(row_dict: dict) -> dict:
+    item = dict(row_dict)
+    clean_addr, username, _, birthdate, gender = unpack_address_and_auth(item.get("address"))
+    item["address"] = clean_addr
+    item["username"] = username
+    item["birthdate"] = birthdate
+    item["gender"] = gender
+    return item
 
 
 async def generate_next_customer_id(conn: asyncpg.Connection) -> str:
@@ -90,8 +127,6 @@ async def lifespan(app: FastAPI):
             max_size=5,
             statement_cache_size=0,
         )
-        async with app.state.pool.acquire() as conn:
-            await ensure_auth_schema(conn)
     except Exception as e:
         print(f"Pool startup notice: {e}")
     yield
@@ -527,7 +562,7 @@ def handle_db_exception(err: Exception) -> None:
     if isinstance(err, asyncpg.UniqueViolationError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="ERR-409-DUPLICATE: An account or record with this email, username, or reference ID already exists.",
+            detail="ERR-409-DUPLICATE: An account or record with this email or reference ID already exists.",
         )
 
     if isinstance(err, asyncpg.ForeignKeyViolationError):
@@ -646,198 +681,174 @@ async def verify_code(req: VerifyCodeRequest):
 @app.post("/auth/register", status_code=status.HTTP_201_CREATED, response_model=CustomerResponse, tags=["Authentication"])
 async def register_customer_account(req: CustomerRegisterRequest):
     async with acquire_db_connection() as conn:
-        await ensure_auth_schema(conn)
-        async with conn.transaction():
-            try:
-                email_clean = str(req.email).lower().strip()
-                username_clean = req.username.strip()
+        try:
+            email_clean = str(req.email).lower().strip()
+            username_clean = req.username.strip()
 
-                dup_user = await conn.fetchrow(
-                    "SELECT customer_id FROM resort.customer_auth WHERE LOWER(username) = LOWER($1)",
-                    username_clean,
-                )
-                if dup_user:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="Username is already taken. Please choose a different username.",
-                    )
-
-                existing_cust = await conn.fetchrow(
-                    "SELECT customer_id FROM resort.customer WHERE LOWER(email) = LOWER($1)",
-                    email_clean,
-                )
-
-                if existing_cust:
-                    cust_id = existing_cust["customer_id"]
-                    existing_auth = await conn.fetchrow(
-                        "SELECT customer_id FROM resort.customer_auth WHERE customer_id = $1",
-                        cust_id,
-                    )
-                    if existing_auth:
+            # Check if username is already used by any customer
+            all_rows = await conn.fetch("SELECT customer_id, email, address FROM resort.customer")
+            for r in all_rows:
+                _, u_existing, p_existing, _, _ = unpack_address_and_auth(r["address"])
+                if u_existing and u_existing.lower() == username_clean.lower():
+                    if not r["email"] or r["email"].lower() != email_clean:
                         raise HTTPException(
                             status_code=status.HTTP_409_CONFLICT,
-                            detail="An account with this email is already registered. Please log in.",
+                            detail="Username is already taken. Please choose a different username.",
                         )
+
+            pwd_hash = hash_password_compact(req.password)
+            packed_address = pack_address_with_auth(
+                req.address,
+                username=username_clean,
+                pwd_hash=pwd_hash,
+                birthdate=req.birthdate,
+                gender=req.gender,
+            )
+
+            existing_cust = await conn.fetchrow(
+                "SELECT customer_id, address FROM resort.customer WHERE LOWER(email) = LOWER($1)",
+                email_clean,
+            )
+
+            if existing_cust:
+                _, _, existing_pwd, _, _ = unpack_address_and_auth(existing_cust["address"])
+                if existing_pwd:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="An account with this email is already registered. Please log in.",
+                    )
+                cust_row = await conn.fetchrow(
+                    """
+                    UPDATE resort.customer
+                    SET first_name = $1, middle_name = $2, last_name = $3, phone = $4, address = $5, customer_type = 'Registered'
+                    WHERE customer_id = $6
+                    RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                    """,
+                    req.first_name,
+                    req.middle_name,
+                    req.last_name,
+                    req.phone,
+                    packed_address,
+                    existing_cust["customer_id"],
+                )
+            else:
+                try:
                     cust_row = await conn.fetchrow(
                         """
-                        UPDATE resort.customer
-                        SET first_name = $1, middle_name = $2, last_name = $3, phone = $4, address = $5, customer_type = 'Registered'
-                        WHERE customer_id = $6
+                        INSERT INTO resort.customer (first_name, middle_name, last_name, email, phone, address, customer_type)
+                        VALUES ($1, $2, $3, $4, $5, $6, 'Registered')
                         RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
                         """,
                         req.first_name,
                         req.middle_name,
                         req.last_name,
+                        email_clean,
                         req.phone,
-                        req.address,
-                        cust_id,
+                        packed_address,
                     )
-                else:
-                    try:
-                        cust_row = await conn.fetchrow(
-                            """
-                            INSERT INTO resort.customer (first_name, middle_name, last_name, email, phone, address, customer_type)
-                            VALUES ($1, $2, $3, $4, $5, $6, 'Registered')
-                            RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
-                            """,
-                            req.first_name,
-                            req.middle_name,
-                            req.last_name,
-                            email_clean,
-                            req.phone,
-                            req.address,
-                        )
-                    except asyncpg.NotNullViolationError:
-                        next_id = await generate_next_customer_id(conn)
-                        cust_row = await conn.fetchrow(
-                            """
-                            INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, 'Registered')
-                            RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
-                            """,
-                            next_id,
-                            req.first_name,
-                            req.middle_name,
-                            req.last_name,
-                            email_clean,
-                            req.phone,
-                            req.address,
-                        )
+                except asyncpg.NotNullViolationError:
+                    next_id = await generate_next_customer_id(conn)
+                    cust_row = await conn.fetchrow(
+                        """
+                        INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, 'Registered')
+                        RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                        """,
+                        next_id,
+                        req.first_name,
+                        req.middle_name,
+                        req.last_name,
+                        email_clean,
+                        req.phone,
+                        packed_address,
+                    )
 
-                pwd_hash = hash_password(req.password)
-                await conn.execute(
-                    """
-                    INSERT INTO resort.customer_auth (customer_id, username, password_hash, birthdate, gender)
-                    VALUES ($1, $2, $3, $4, $5)
-                    """,
-                    cust_row["customer_id"],
-                    username_clean,
-                    pwd_hash,
-                    req.birthdate,
-                    req.gender,
-                )
-
-                res = dict(cust_row)
-                res["username"] = username_clean
-                res["birthdate"] = req.birthdate
-                res["gender"] = req.gender
-                return res
-            except HTTPException:
-                raise
-            except Exception as err:
-                handle_db_exception(err)
+            return format_customer_row(dict(cust_row))
+        except HTTPException:
+            raise
+        except Exception as err:
+            handle_db_exception(err)
 
 
 @app.post("/auth/login", status_code=status.HTTP_200_OK, response_model=CustomerResponse, tags=["Authentication"])
 async def login_customer_account(req: CustomerLoginRequest):
     async with acquire_db_connection() as conn:
-        await ensure_auth_schema(conn)
         ident = req.identifier.strip()
         pwd = req.password
 
-        row = await conn.fetchrow(
+        rows = await conn.fetch(
             """
-            SELECT c.customer_id, c.first_name, c.middle_name, c.last_name, c.email, c.phone, c.address, c.customer_type,
-                   ca.username, ca.password_hash, ca.birthdate, ca.gender
-            FROM resort.customer c
-            LEFT JOIN resort.customer_auth ca ON c.customer_id = ca.customer_id
-            WHERE LOWER(c.email) = LOWER($1)
-               OR LOWER(ca.username) = LOWER($1)
-               OR LOWER(c.customer_id) = LOWER($1)
-            LIMIT 1
-            """,
-            ident,
+            SELECT customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+            FROM resort.customer
+            ORDER BY customer_id
+            """
         )
 
-        if row is None:
+        matched_row = None
+        for r in rows:
+            c_email = (r["email"] or "").strip()
+            c_id = (r["customer_id"] or "").strip()
+            _, c_username, _, _, _ = unpack_address_and_auth(r["address"])
+
+            if (
+                c_email.lower() == ident.lower()
+                or (c_username and c_username.lower() == ident.lower())
+                or c_id.lower() == ident.lower()
+            ):
+                matched_row = r
+                break
+
+        if matched_row is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Account not found. Please register an account first.",
             )
 
-        stored_hash = row["password_hash"]
+        _, _, stored_hash, _, _ = unpack_address_and_auth(matched_row["address"])
         if not stored_hash:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="This account has not set a password yet or was registered via Google Sign-In. Please sign up or use Google Sign-In.",
+                detail="This account was signed in via Google and does not have a password set. Please use Google Sign-In or sign up with a password.",
             )
 
-        if not verify_password(pwd, stored_hash):
+        if not verify_password_compact(pwd, stored_hash):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect password. Please try again.",
             )
 
-        res = {
-            "customer_id": row["customer_id"],
-            "first_name": row["first_name"],
-            "middle_name": row["middle_name"],
-            "last_name": row["last_name"],
-            "email": row["email"],
-            "phone": row["phone"],
-            "address": row["address"],
-            "customer_type": row["customer_type"],
-            "username": row["username"],
-            "birthdate": row["birthdate"],
-            "gender": row["gender"],
-        }
-        return res
+        return format_customer_row(dict(matched_row))
 
 
 # --- CUSTOMERS CRUD ---
 @app.get("/customers", response_model=List[CustomerResponse], tags=["Customers"])
 async def get_customers():
     async with acquire_db_connection() as conn:
-        await ensure_auth_schema(conn)
         rows = await conn.fetch(
             """
-            SELECT c.customer_id, c.first_name, c.middle_name, c.last_name, c.email, c.phone, c.address, c.customer_type,
-                   ca.username, ca.birthdate, ca.gender
-            FROM resort.customer c
-            LEFT JOIN resort.customer_auth ca ON c.customer_id = ca.customer_id
-            ORDER BY c.customer_id
+            SELECT customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+            FROM resort.customer
+            ORDER BY customer_id
             """
         )
-        return [dict(r) for r in rows]
+        return [format_customer_row(dict(r)) for r in rows]
 
 
 @app.get("/customers/{customer_id}", response_model=CustomerResponse, tags=["Customers"])
 async def get_customer(customer_id: str):
     async with acquire_db_connection() as conn:
-        await ensure_auth_schema(conn)
         row = await conn.fetchrow(
             """
-            SELECT c.customer_id, c.first_name, c.middle_name, c.last_name, c.email, c.phone, c.address, c.customer_type,
-                   ca.username, ca.birthdate, ca.gender
-            FROM resort.customer c
-            LEFT JOIN resort.customer_auth ca ON c.customer_id = ca.customer_id
-            WHERE c.customer_id = $1 OR LOWER(c.email) = LOWER($1) OR LOWER(ca.username) = LOWER($1)
+            SELECT customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+            FROM resort.customer
+            WHERE customer_id = $1 OR LOWER(email) = LOWER($1)
+            LIMIT 1
             """,
             customer_id,
         )
         if row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
-        return dict(row)
+        return format_customer_row(dict(row))
 
 
 @app.post("/customers", status_code=status.HTTP_201_CREATED, response_model=CustomerResponse, tags=["Customers"])
@@ -876,7 +887,7 @@ async def create_customer(customer: CustomerCreate):
                     customer.address,
                     customer.customer_type,
                 )
-            return dict(row)
+            return format_customer_row(dict(row))
         except Exception as err:
             handle_db_exception(err)
 
@@ -884,43 +895,70 @@ async def create_customer(customer: CustomerCreate):
 @app.post("/customers/sync-google", status_code=status.HTTP_200_OK, response_model=CustomerResponse, tags=["Customers"])
 async def sync_google_customer(customer: CustomerSyncGoogle):
     async with acquire_db_connection() as conn:
-        await ensure_auth_schema(conn)
         try:
-            phone_val = customer.phone if customer.phone and customer.phone.strip() and customer.phone != "N/A" else "09123456789"
-            address_val = customer.address if customer.address and customer.address.strip() and customer.address != "N/A" else "Cebu City"
-
+            email_clean = str(customer.email).lower().strip()
             existing = await conn.fetchrow(
                 """
-                UPDATE resort.customer
-                SET first_name = $1,
-                    middle_name = COALESCE($2, middle_name),
-                    last_name = $3,
-                    phone = CASE WHEN $4 = '09123456789' THEN phone ELSE $4 END,
-                    address = CASE WHEN $5 = 'Cebu City' THEN address ELSE $5 END
-                WHERE LOWER(email) = LOWER($6)
-                RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                SELECT customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                FROM resort.customer
+                WHERE LOWER(email) = LOWER($1)
+                LIMIT 1
                 """,
-                customer.first_name,
-                customer.middle_name,
-                customer.last_name,
-                phone_val,
-                address_val,
-                customer.email,
+                email_clean,
             )
+
             if existing:
-                if customer.birthdate or customer.gender:
-                    await conn.execute(
-                        """
-                        UPDATE resort.customer_auth
-                        SET birthdate = COALESCE($1, birthdate),
-                            gender = COALESCE($2, gender)
-                        WHERE customer_id = $3
-                        """,
-                        customer.birthdate,
-                        customer.gender,
-                        existing["customer_id"],
-                    )
-                return dict(existing)
+                ex_clean_addr, ex_user, ex_pwd, ex_bday, ex_gender = unpack_address_and_auth(existing["address"])
+                new_phone = (
+                    customer.phone.strip()
+                    if customer.phone and customer.phone.strip() not in ("", "N/A", "Not Set", "09123456789")
+                    else existing["phone"]
+                )
+                new_clean_addr = (
+                    customer.address.strip()
+                    if customer.address and customer.address.strip() not in ("", "N/A", "Not Set", "Cebu City")
+                    else (ex_clean_addr or "Cebu City")
+                )
+                new_bday = customer.birthdate if customer.birthdate and customer.birthdate not in ("", "Not Set") else ex_bday
+                new_gender = customer.gender if customer.gender and customer.gender not in ("", "Not Set") else ex_gender
+
+                packed_addr = pack_address_with_auth(
+                    new_clean_addr,
+                    username=ex_user,
+                    pwd_hash=ex_pwd,
+                    birthdate=new_bday,
+                    gender=new_gender,
+                )
+
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE resort.customer
+                    SET first_name = $1,
+                        middle_name = COALESCE($2, middle_name),
+                        last_name = $3,
+                        phone = $4,
+                        address = $5
+                    WHERE customer_id = $6
+                    RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                    """,
+                    customer.first_name,
+                    customer.middle_name,
+                    customer.last_name,
+                    new_phone,
+                    packed_addr,
+                    existing["customer_id"],
+                )
+                return format_customer_row(dict(updated))
+
+            phone_val = customer.phone.strip() if customer.phone and customer.phone.strip() not in ("", "N/A", "Not Set") else "09123456789"
+            addr_val = customer.address.strip() if customer.address and customer.address.strip() not in ("", "N/A", "Not Set") else "Cebu City"
+            packed_addr = pack_address_with_auth(
+                addr_val,
+                username=None,
+                pwd_hash=None,
+                birthdate=customer.birthdate,
+                gender=customer.gender,
+            )
 
             try:
                 row = await conn.fetchrow(
@@ -932,9 +970,9 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
                     customer.first_name,
                     customer.middle_name,
                     customer.last_name,
-                    str(customer.email).lower().strip(),
+                    email_clean,
                     phone_val,
-                    address_val,
+                    packed_addr,
                 )
             except asyncpg.NotNullViolationError:
                 next_id = await generate_next_customer_id(conn)
@@ -948,11 +986,11 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
                     customer.first_name,
                     customer.middle_name,
                     customer.last_name,
-                    str(customer.email).lower().strip(),
+                    email_clean,
                     phone_val,
-                    address_val,
+                    packed_addr,
                 )
-            return dict(row)
+            return format_customer_row(dict(row))
         except Exception as err:
             handle_db_exception(err)
 
@@ -961,11 +999,27 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
 async def update_customer(customer_id: str, customer: CustomerUpdate):
     async with acquire_db_connection() as conn:
         try:
+            existing = await conn.fetchrow(
+                "SELECT customer_id, address FROM resort.customer WHERE customer_id = $1 OR LOWER(email) = LOWER($1)",
+                customer_id,
+            )
+            if existing is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
+
+            _, ex_user, ex_pwd, ex_bday, ex_gender = unpack_address_and_auth(existing["address"])
+            packed_addr = pack_address_with_auth(
+                customer.address,
+                username=ex_user,
+                pwd_hash=ex_pwd,
+                birthdate=ex_bday,
+                gender=ex_gender,
+            )
+
             row = await conn.fetchrow(
                 """
                 UPDATE resort.customer
                 SET first_name = $1, middle_name = $2, last_name = $3, email = $4, phone = $5, address = $6, customer_type = $7
-                WHERE customer_id = $8 OR LOWER(email) = LOWER($8)
+                WHERE customer_id = $8
                 RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
                 """,
                 customer.first_name,
@@ -973,13 +1027,13 @@ async def update_customer(customer_id: str, customer: CustomerUpdate):
                 customer.last_name,
                 customer.email,
                 customer.phone,
-                customer.address,
+                packed_addr,
                 customer.customer_type,
-                customer_id,
+                existing["customer_id"],
             )
-            if row is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found.")
-            return dict(row)
+            return format_customer_row(dict(row))
+        except HTTPException:
+            raise
         except Exception as err:
             handle_db_exception(err)
 
@@ -1314,21 +1368,21 @@ async def create_booking(booking: BookingCreate):
                         staff_id_val,
                     )
 
-                # Strictly verify that the customer exists in resort.customer (DO NOT auto-create fake accounts)
+                # Look up registered customer by customer_id OR customer_email
                 raw_cust = booking.customer_id.strip()
                 raw_email = booking.customer_email.strip().lower() if booking.customer_email and booking.customer_email.strip() else ""
 
-                existing_cust = await conn.fetchrow(
-                    """
-                    SELECT customer_id, email
-                    FROM resort.customer
-                    WHERE customer_id = $1
-                       OR ($2 <> '' AND LOWER(email) = LOWER($2))
-                    LIMIT 1
-                    """,
-                    raw_cust,
-                    raw_email,
-                )
+                existing_cust = None
+                if raw_email:
+                    existing_cust = await conn.fetchrow(
+                        "SELECT customer_id, email FROM resort.customer WHERE LOWER(email) = LOWER($1) LIMIT 1",
+                        raw_email,
+                    )
+                if not existing_cust and raw_cust:
+                    existing_cust = await conn.fetchrow(
+                        "SELECT customer_id, email FROM resort.customer WHERE customer_id = $1 OR LOWER(email) = LOWER($1) LIMIT 1",
+                        raw_cust,
+                    )
 
                 if not existing_cust:
                     raise HTTPException(
