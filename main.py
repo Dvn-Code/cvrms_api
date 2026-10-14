@@ -28,12 +28,8 @@ except Exception:
 
 load_dotenv()
 
-# Philippine Standard Time (UTC+8) for accurate local resort date/time checks
 PH_TZ = timezone(timedelta(hours=8))
 
-# =============================================================================
-# DATABASE CONFIGURATION (NO HARDCODED DB PASSWORDS)
-# =============================================================================
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
@@ -43,9 +39,48 @@ DB_NAME = os.getenv("DB_NAME", "postgres")
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 
-# =============================================================================
-# APPLICATION LIFESPAN & ASYNCPG CONNECTION POOL
-# =============================================================================
+def hash_password(password: str, salt: Optional[str] = None) -> str:
+    if not salt:
+        salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000)
+    return f"{salt}${dk.hex()}"
+
+
+def verify_password(plain_password: str, stored_hash: str) -> bool:
+    if not stored_hash or "$" not in stored_hash:
+        return False
+    salt, _ = stored_hash.split("$", 1)
+    expected = hash_password(plain_password, salt)
+    return secrets.compare_digest(expected, stored_hash)
+
+
+async def ensure_auth_schema(conn: asyncpg.Connection):
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS resort.customer_auth (
+            customer_id VARCHAR(10) PRIMARY KEY REFERENCES resort.customer(customer_id) ON DELETE CASCADE,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            birthdate VARCHAR(20),
+            gender VARCHAR(20),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+
+async def generate_next_customer_id(conn: asyncpg.Connection) -> str:
+    row = await conn.fetchrow(
+        """
+        SELECT COALESCE(MAX(CAST(SUBSTRING(customer_id FROM '([0-9]+)$') AS INTEGER)), 100) AS max_num
+        FROM resort.customer
+        WHERE customer_id ~ '^CUST-[0-9]+$'
+        """
+    )
+    next_num = (row["max_num"] if row and row["max_num"] is not None else 100) + 1
+    return f"CUST-{next_num:03d}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -55,6 +90,8 @@ async def lifespan(app: FastAPI):
             max_size=5,
             statement_cache_size=0,
         )
+        async with app.state.pool.acquire() as conn:
+            await ensure_auth_schema(conn)
     except Exception as e:
         print(f"Pool startup notice: {e}")
     yield
@@ -65,22 +102,16 @@ async def lifespan(app: FastAPI):
             pass
 
 
-# =============================================================================
-# SWAGGER & STAFF AUTHENTICATION GUARDS
-# =============================================================================
 docs_security = HTTPBasic(auto_error=True)
 
-# Swagger Docs credentials
 ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
 ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "@Guest12345")
 STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
 
 
 def verify_swagger_credentials(credentials: HTTPBasicCredentials = Depends(docs_security)):
-    """Browser basic auth guard protecting /docs and /redoc."""
     is_user_valid = secrets.compare_digest(credentials.username, ADMIN_USER)
     is_pass_valid = secrets.compare_digest(credentials.password, ADMIN_PASS)
-
     if not (is_user_valid and is_pass_valid):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -94,10 +125,6 @@ async def verify_staff_token(
     request: Request,
     x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
 ):
-    """
-    Staff guard that checks X-Staff-Token or Authorization headers directly.
-    Does NOT register an OpenAPI security scheme, keeping Swagger UI free of the green lock.
-    """
     if x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
         return x_staff_token
 
@@ -119,15 +146,6 @@ async def verify_staff_token(
     )
 
 
-def generate_short_customer_id(seed: str) -> str:
-    """Generates a deterministic 10-character customer_id (e.g. C-8F3A1B2C) that fits VARCHAR(10)."""
-    digest = hashlib.md5(seed.strip().lower().encode("utf-8")).hexdigest()[:8].upper()
-    return f"C-{digest}"
-
-
-# =============================================================================
-# FASTAPI INSTANCE (DEFAULT SWAGGER URLS DISABLED)
-# =============================================================================
 app = FastAPI(
     title="Casa Vista Resort Management System (CVRMS) API",
     description="Backend API supporting Resort Accommodations, Sports Amenities, Cashless Payments, and POS Retail Modules.",
@@ -139,9 +157,6 @@ app = FastAPI(
 )
 
 
-# =============================================================================
-# PROTECTED SWAGGER ROUTES (BASIC AUTH POPUP, NO GREEN LOCK)
-# =============================================================================
 @app.get("/docs", include_in_schema=False)
 async def get_swagger_ui(username: str = Depends(verify_swagger_credentials)):
     return get_swagger_ui_html(
@@ -184,11 +199,7 @@ async def acquire_db_connection():
         yield conn
 
 
-# =============================================================================
-# PYDANTIC SCHEMAS
-# =============================================================================
-
-# --- CUSTOMER SCHEMAS ---
+# --- SCHEMAS ---
 class CustomerBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -226,6 +237,28 @@ class CustomerCreate(CustomerBase):
         return self
 
 
+class CustomerRegisterRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    first_name: str = Field(min_length=1, max_length=50)
+    middle_name: Optional[str] = Field(default=None, max_length=50)
+    last_name: str = Field(min_length=1, max_length=50)
+    email: EmailStr
+    phone: str = Field(min_length=7, max_length=20)
+    address: str = Field(min_length=2, max_length=255)
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=4, max_length=128)
+    birthdate: Optional[str] = None
+    gender: Optional[str] = None
+
+
+class CustomerLoginRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    identifier: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=128)
+
+
 class CustomerSyncGoogle(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -233,8 +266,10 @@ class CustomerSyncGoogle(BaseModel):
     first_name: str = Field(min_length=1, max_length=50)
     middle_name: Optional[str] = Field(default=None, max_length=50)
     last_name: str = Field(min_length=1, max_length=50)
-    phone: Optional[str] = Field(default="N/A", max_length=20)
-    address: Optional[str] = Field(default=None, max_length=255)
+    phone: Optional[str] = Field(default="09123456789", max_length=20)
+    address: Optional[str] = Field(default="Cebu City", max_length=255)
+    birthdate: Optional[str] = None
+    gender: Optional[str] = None
     customer_type: Literal["Registered", "Walk-In"] = "Registered"
 
 
@@ -252,10 +287,12 @@ class CustomerResponse(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
+    username: Optional[str] = None
+    birthdate: Optional[str] = None
+    gender: Optional[str] = None
     customer_type: str = "Registered"
 
 
-# --- STAFF SCHEMAS ---
 class StaffBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -277,7 +314,6 @@ class StaffResponse(StaffBase):
     staff_id: str
 
 
-# --- ROOM SCHEMAS ---
 class RoomBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -300,7 +336,6 @@ class RoomResponse(RoomBase):
     room_id: str
 
 
-# --- COURT SCHEMAS ---
 class CourtBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -323,7 +358,6 @@ class CourtResponse(CourtBase):
     court_id: str
 
 
-# --- BOOKING SCHEMAS ---
 class BookingBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -391,7 +425,6 @@ class BookingResponse(BaseModel):
     hold_expires_at: Optional[datetime] = None
 
 
-# --- PAYMENT SCHEMAS ---
 class PaymentCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -421,7 +454,6 @@ class PaymentResponse(BaseModel):
     paid_at: datetime
 
 
-# --- POS SCHEMAS ---
 class POSItemBase(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -476,9 +508,6 @@ class POSOrderResponse(BaseModel):
     items: List[POSOrderItemResponse] = []
 
 
-# =============================================================================
-# EXCEPTION DISPATCHER
-# =============================================================================
 def handle_db_exception(err: Exception) -> None:
     print(f"\n>>> [DATABASE ERROR CAUGHT]: {type(err).__name__} -> {err}\n")
 
@@ -486,42 +515,39 @@ def handle_db_exception(err: Exception) -> None:
     if "Exclusive booking blocked" in err_msg or "Court booking blocked" in err_msg:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"ERR-409-COLLISION: {err_msg}"
+            detail=f"ERR-409-COLLISION: {err_msg}",
         )
 
     if isinstance(err, asyncpg.ExclusionViolationError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="ERR-409-ROOM-COLLISION: Sorry, this suite or sports court is already reserved for your selected dates/time. Please select a different date range or facility."
+            detail="ERR-409-ROOM-COLLISION: Sorry, this suite or sports court is already reserved for your selected dates/time. Please select a different date range or facility.",
         )
 
     if isinstance(err, asyncpg.UniqueViolationError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="ERR-409-DUPLICATE: Sorry, a reservation or record with this reference ID already exists in the system."
+            detail="ERR-409-DUPLICATE: An account or record with this email, username, or reference ID already exists.",
         )
 
     if isinstance(err, asyncpg.ForeignKeyViolationError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="ERR-400-INVALID-REF: Sorry, the referenced customer, staff, room, or court ID was not found."
+            detail="ERR-400-INVALID-REF: Sorry, the referenced customer, staff, room, or court ID was not found.",
         )
 
     if isinstance(err, asyncpg.CheckViolationError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="ERR-400-RULE-VIOLATION: Sorry, your request violates resort booking policies (e.g. invalid stay dates or capacity limit)."
+            detail="ERR-400-RULE-VIOLATION: Sorry, your request violates resort booking policies.",
         )
 
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"ERR-400-SYSTEM-ISSUE: Reservation request failed. ({type(err).__name__}: {err_msg})"
+        detail=f"ERR-400-SYSTEM-ISSUE: Request failed. ({type(err).__name__}: {err_msg})",
     )
 
 
-# =============================================================================
-# ROOT ENDPOINT
-# =============================================================================
 @app.get("/")
 def read_root():
     return {
@@ -532,9 +558,7 @@ def read_root():
     }
 
 
-# =============================================================================
-# IN-MEMORY OTP VERIFICATION
-# =============================================================================
+# --- AUTHENTICATION & OTP ---
 verification_store: dict[str, dict] = {}
 
 
@@ -619,17 +643,179 @@ async def verify_code(req: VerifyCodeRequest):
     return {"verified": True, "message": "Email verified successfully."}
 
 
-# =============================================================================
-# RESORT MODULE: CUSTOMERS CRUD
-# =============================================================================
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED, response_model=CustomerResponse, tags=["Authentication"])
+async def register_customer_account(req: CustomerRegisterRequest):
+    async with acquire_db_connection() as conn:
+        await ensure_auth_schema(conn)
+        async with conn.transaction():
+            try:
+                email_clean = str(req.email).lower().strip()
+                username_clean = req.username.strip()
+
+                dup_user = await conn.fetchrow(
+                    "SELECT customer_id FROM resort.customer_auth WHERE LOWER(username) = LOWER($1)",
+                    username_clean,
+                )
+                if dup_user:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Username is already taken. Please choose a different username.",
+                    )
+
+                existing_cust = await conn.fetchrow(
+                    "SELECT customer_id FROM resort.customer WHERE LOWER(email) = LOWER($1)",
+                    email_clean,
+                )
+
+                if existing_cust:
+                    cust_id = existing_cust["customer_id"]
+                    existing_auth = await conn.fetchrow(
+                        "SELECT customer_id FROM resort.customer_auth WHERE customer_id = $1",
+                        cust_id,
+                    )
+                    if existing_auth:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="An account with this email is already registered. Please log in.",
+                        )
+                    cust_row = await conn.fetchrow(
+                        """
+                        UPDATE resort.customer
+                        SET first_name = $1, middle_name = $2, last_name = $3, phone = $4, address = $5, customer_type = 'Registered'
+                        WHERE customer_id = $6
+                        RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                        """,
+                        req.first_name,
+                        req.middle_name,
+                        req.last_name,
+                        req.phone,
+                        req.address,
+                        cust_id,
+                    )
+                else:
+                    try:
+                        cust_row = await conn.fetchrow(
+                            """
+                            INSERT INTO resort.customer (first_name, middle_name, last_name, email, phone, address, customer_type)
+                            VALUES ($1, $2, $3, $4, $5, $6, 'Registered')
+                            RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                            """,
+                            req.first_name,
+                            req.middle_name,
+                            req.last_name,
+                            email_clean,
+                            req.phone,
+                            req.address,
+                        )
+                    except asyncpg.NotNullViolationError:
+                        next_id = await generate_next_customer_id(conn)
+                        cust_row = await conn.fetchrow(
+                            """
+                            INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, 'Registered')
+                            RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                            """,
+                            next_id,
+                            req.first_name,
+                            req.middle_name,
+                            req.last_name,
+                            email_clean,
+                            req.phone,
+                            req.address,
+                        )
+
+                pwd_hash = hash_password(req.password)
+                await conn.execute(
+                    """
+                    INSERT INTO resort.customer_auth (customer_id, username, password_hash, birthdate, gender)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    cust_row["customer_id"],
+                    username_clean,
+                    pwd_hash,
+                    req.birthdate,
+                    req.gender,
+                )
+
+                res = dict(cust_row)
+                res["username"] = username_clean
+                res["birthdate"] = req.birthdate
+                res["gender"] = req.gender
+                return res
+            except HTTPException:
+                raise
+            except Exception as err:
+                handle_db_exception(err)
+
+
+@app.post("/auth/login", status_code=status.HTTP_200_OK, response_model=CustomerResponse, tags=["Authentication"])
+async def login_customer_account(req: CustomerLoginRequest):
+    async with acquire_db_connection() as conn:
+        await ensure_auth_schema(conn)
+        ident = req.identifier.strip()
+        pwd = req.password
+
+        row = await conn.fetchrow(
+            """
+            SELECT c.customer_id, c.first_name, c.middle_name, c.last_name, c.email, c.phone, c.address, c.customer_type,
+                   ca.username, ca.password_hash, ca.birthdate, ca.gender
+            FROM resort.customer c
+            LEFT JOIN resort.customer_auth ca ON c.customer_id = ca.customer_id
+            WHERE LOWER(c.email) = LOWER($1)
+               OR LOWER(ca.username) = LOWER($1)
+               OR LOWER(c.customer_id) = LOWER($1)
+            LIMIT 1
+            """,
+            ident,
+        )
+
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account not found. Please register an account first.",
+            )
+
+        stored_hash = row["password_hash"]
+        if not stored_hash:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="This account has not set a password yet or was registered via Google Sign-In. Please sign up or use Google Sign-In.",
+            )
+
+        if not verify_password(pwd, stored_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect password. Please try again.",
+            )
+
+        res = {
+            "customer_id": row["customer_id"],
+            "first_name": row["first_name"],
+            "middle_name": row["middle_name"],
+            "last_name": row["last_name"],
+            "email": row["email"],
+            "phone": row["phone"],
+            "address": row["address"],
+            "customer_type": row["customer_type"],
+            "username": row["username"],
+            "birthdate": row["birthdate"],
+            "gender": row["gender"],
+        }
+        return res
+
+
+# --- CUSTOMERS CRUD ---
 @app.get("/customers", response_model=List[CustomerResponse], tags=["Customers"])
 async def get_customers():
     async with acquire_db_connection() as conn:
+        await ensure_auth_schema(conn)
         rows = await conn.fetch(
             """
-            SELECT customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
-            FROM resort.customer
-            ORDER BY customer_id
+            SELECT c.customer_id, c.first_name, c.middle_name, c.last_name, c.email, c.phone, c.address, c.customer_type,
+                   ca.username, ca.birthdate, ca.gender
+            FROM resort.customer c
+            LEFT JOIN resort.customer_auth ca ON c.customer_id = ca.customer_id
+            ORDER BY c.customer_id
             """
         )
         return [dict(r) for r in rows]
@@ -638,11 +824,14 @@ async def get_customers():
 @app.get("/customers/{customer_id}", response_model=CustomerResponse, tags=["Customers"])
 async def get_customer(customer_id: str):
     async with acquire_db_connection() as conn:
+        await ensure_auth_schema(conn)
         row = await conn.fetchrow(
             """
-            SELECT customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
-            FROM resort.customer
-            WHERE customer_id = $1 OR LOWER(email) = LOWER($1)
+            SELECT c.customer_id, c.first_name, c.middle_name, c.last_name, c.email, c.phone, c.address, c.customer_type,
+                   ca.username, ca.birthdate, ca.gender
+            FROM resort.customer c
+            LEFT JOIN resort.customer_auth ca ON c.customer_id = ca.customer_id
+            WHERE c.customer_id = $1 OR LOWER(c.email) = LOWER($1) OR LOWER(ca.username) = LOWER($1)
             """,
             customer_id,
         )
@@ -651,53 +840,54 @@ async def get_customer(customer_id: str):
         return dict(row)
 
 
-@app.post(
-    "/customers",
-    status_code=status.HTTP_201_CREATED,
-    response_model=CustomerResponse,
-    tags=["Customers"],
-)
+@app.post("/customers", status_code=status.HTTP_201_CREATED, response_model=CustomerResponse, tags=["Customers"])
 async def create_customer(customer: CustomerCreate):
     async with acquire_db_connection() as conn:
         try:
-            cust_id = generate_short_customer_id(customer.email or f"{customer.first_name}-{customer.phone}")
-            row = await conn.fetchrow(
-                """
-                INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT (email) DO UPDATE
-                SET first_name = EXCLUDED.first_name,
-                    middle_name = COALESCE(EXCLUDED.middle_name, resort.customer.middle_name),
-                    last_name = EXCLUDED.last_name,
-                    phone = EXCLUDED.phone,
-                    address = COALESCE(EXCLUDED.address, resort.customer.address)
-                RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
-                """,
-                cust_id,
-                customer.first_name,
-                customer.middle_name,
-                customer.last_name,
-                customer.email,
-                customer.phone,
-                customer.address,
-                customer.customer_type,
-            )
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO resort.customer (first_name, middle_name, last_name, email, phone, address, customer_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                    """,
+                    customer.first_name,
+                    customer.middle_name,
+                    customer.last_name,
+                    customer.email,
+                    customer.phone,
+                    customer.address,
+                    customer.customer_type,
+                )
+            except asyncpg.NotNullViolationError:
+                next_id = await generate_next_customer_id(conn)
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                    """,
+                    next_id,
+                    customer.first_name,
+                    customer.middle_name,
+                    customer.last_name,
+                    customer.email,
+                    customer.phone,
+                    customer.address,
+                    customer.customer_type,
+                )
             return dict(row)
         except Exception as err:
             handle_db_exception(err)
 
 
-@app.post(
-    "/customers/sync-google",
-    status_code=status.HTTP_200_OK,
-    response_model=CustomerResponse,
-    tags=["Customers"],
-)
+@app.post("/customers/sync-google", status_code=status.HTTP_200_OK, response_model=CustomerResponse, tags=["Customers"])
 async def sync_google_customer(customer: CustomerSyncGoogle):
     async with acquire_db_connection() as conn:
+        await ensure_auth_schema(conn)
         try:
-            phone_val = customer.phone if customer.phone and customer.phone.strip() else "09123456789"
-            address_val = customer.address if customer.address and customer.address.strip() else "Cebu City"
+            phone_val = customer.phone if customer.phone and customer.phone.strip() and customer.phone != "N/A" else "09123456789"
+            address_val = customer.address if customer.address and customer.address.strip() and customer.address != "N/A" else "Cebu City"
 
             existing = await conn.fetchrow(
                 """
@@ -705,8 +895,8 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
                 SET first_name = $1,
                     middle_name = COALESCE($2, middle_name),
                     last_name = $3,
-                    phone = CASE WHEN $4 = 'N/A' THEN phone ELSE $4 END,
-                    address = CASE WHEN $5 = 'N/A' OR $5 IS NULL THEN address ELSE $5 END
+                    phone = CASE WHEN $4 = '09123456789' THEN phone ELSE $4 END,
+                    address = CASE WHEN $5 = 'Cebu City' THEN address ELSE $5 END
                 WHERE LOWER(email) = LOWER($6)
                 RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
                 """,
@@ -718,38 +908,56 @@ async def sync_google_customer(customer: CustomerSyncGoogle):
                 customer.email,
             )
             if existing:
+                if customer.birthdate or customer.gender:
+                    await conn.execute(
+                        """
+                        UPDATE resort.customer_auth
+                        SET birthdate = COALESCE($1, birthdate),
+                            gender = COALESCE($2, gender)
+                        WHERE customer_id = $3
+                        """,
+                        customer.birthdate,
+                        customer.gender,
+                        existing["customer_id"],
+                    )
                 return dict(existing)
 
-            cust_id = generate_short_customer_id(str(customer.email))
-            row = await conn.fetchrow(
-                """
-                INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, 'Registered')
-                ON CONFLICT (customer_id) DO UPDATE
-                SET first_name = EXCLUDED.first_name,
-                    last_name = EXCLUDED.last_name,
-                    email = EXCLUDED.email
-                RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
-                """,
-                cust_id,
-                customer.first_name,
-                customer.middle_name,
-                customer.last_name,
-                str(customer.email).lower().strip(),
-                phone_val,
-                address_val,
-            )
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO resort.customer (first_name, middle_name, last_name, email, phone, address, customer_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, 'Registered')
+                    RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                    """,
+                    customer.first_name,
+                    customer.middle_name,
+                    customer.last_name,
+                    str(customer.email).lower().strip(),
+                    phone_val,
+                    address_val,
+                )
+            except asyncpg.NotNullViolationError:
+                next_id = await generate_next_customer_id(conn)
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO resort.customer (customer_id, first_name, middle_name, last_name, email, phone, address, customer_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, 'Registered')
+                    RETURNING customer_id, first_name, middle_name, last_name, email, phone, address, customer_type
+                    """,
+                    next_id,
+                    customer.first_name,
+                    customer.middle_name,
+                    customer.last_name,
+                    str(customer.email).lower().strip(),
+                    phone_val,
+                    address_val,
+                )
             return dict(row)
         except Exception as err:
             handle_db_exception(err)
 
 
-@app.put(
-    "/customers/{customer_id}",
-    response_model=CustomerResponse,
-    tags=["Customers"],
-    dependencies=[Depends(verify_staff_token)],
-)
+@app.put("/customers/{customer_id}", response_model=CustomerResponse, tags=["Customers"], dependencies=[Depends(verify_staff_token)])
 async def update_customer(customer_id: str, customer: CustomerUpdate):
     async with acquire_db_connection() as conn:
         try:
@@ -776,12 +984,7 @@ async def update_customer(customer_id: str, customer: CustomerUpdate):
             handle_db_exception(err)
 
 
-@app.delete(
-    "/customers/{customer_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    tags=["Customers"],
-    dependencies=[Depends(verify_staff_token)],
-)
+@app.delete("/customers/{customer_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Customers"], dependencies=[Depends(verify_staff_token)])
 async def delete_customer(customer_id: str):
     async with acquire_db_connection() as conn:
         try:
@@ -793,19 +996,11 @@ async def delete_customer(customer_id: str):
             handle_db_exception(err)
 
 
-# =============================================================================
-# RESORT MODULE: STAFF CRUD
-# =============================================================================
+# --- STAFF CRUD ---
 @app.get("/staff", response_model=List[StaffResponse], tags=["Staff"])
 async def get_staff_members():
     async with acquire_db_connection() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT staff_id, first_name, middle_name, last_name, role
-            FROM resort.staff
-            ORDER BY staff_id
-            """
-        )
+        rows = await conn.fetch("SELECT staff_id, first_name, middle_name, last_name, role FROM resort.staff ORDER BY staff_id")
         return [dict(r) for r in rows]
 
 
@@ -830,30 +1025,17 @@ async def create_staff(staff: StaffCreate):
             handle_db_exception(err)
 
 
-# =============================================================================
-# RESORT MODULE: ROOM INVENTORY CRUD
-# =============================================================================
+# --- ROOMS CRUD ---
 @app.get("/rooms", response_model=List[RoomResponse], tags=["Rooms"])
 async def get_rooms(status_filter: Optional[str] = Query(default=None, alias="status")):
     async with acquire_db_connection() as conn:
         if status_filter:
             rows = await conn.fetch(
-                """
-                SELECT room_id, room_number, rate_per_day, max_pax, status, room_type
-                FROM resort.room
-                WHERE status = $1
-                ORDER BY room_number
-                """,
+                "SELECT room_id, room_number, rate_per_day, max_pax, status, room_type FROM resort.room WHERE status = $1 ORDER BY room_number",
                 status_filter,
             )
         else:
-            rows = await conn.fetch(
-                """
-                SELECT room_id, room_number, rate_per_day, max_pax, status, room_type
-                FROM resort.room
-                ORDER BY room_number
-                """
-            )
+            rows = await conn.fetch("SELECT room_id, room_number, rate_per_day, max_pax, status, room_type FROM resort.room ORDER BY room_number")
         return [dict(r) for r in rows]
 
 
@@ -861,11 +1043,7 @@ async def get_rooms(status_filter: Optional[str] = Query(default=None, alias="st
 async def get_room(room_id: str):
     async with acquire_db_connection() as conn:
         row = await conn.fetchrow(
-            """
-            SELECT room_id, room_number, rate_per_day, max_pax, status, room_type
-            FROM resort.room
-            WHERE room_id = $1
-            """,
+            "SELECT room_id, room_number, rate_per_day, max_pax, status, room_type FROM resort.room WHERE room_id = $1",
             room_id,
         )
         if row is None:
@@ -873,13 +1051,7 @@ async def get_room(room_id: str):
         return dict(row)
 
 
-@app.post(
-    "/rooms",
-    status_code=status.HTTP_201_CREATED,
-    response_model=RoomResponse,
-    tags=["Rooms"],
-    dependencies=[Depends(verify_staff_token)],
-)
+@app.post("/rooms", status_code=status.HTTP_201_CREATED, response_model=RoomResponse, tags=["Rooms"], dependencies=[Depends(verify_staff_token)])
 async def create_room(room: RoomCreate):
     async with acquire_db_connection() as conn:
         try:
@@ -901,12 +1073,7 @@ async def create_room(room: RoomCreate):
             handle_db_exception(err)
 
 
-@app.put(
-    "/rooms/{room_id}",
-    response_model=RoomResponse,
-    tags=["Rooms"],
-    dependencies=[Depends(verify_staff_token)],
-)
+@app.put("/rooms/{room_id}", response_model=RoomResponse, tags=["Rooms"], dependencies=[Depends(verify_staff_token)])
 async def update_room(room_id: str, room: RoomUpdate):
     async with acquire_db_connection() as conn:
         try:
@@ -931,34 +1098,23 @@ async def update_room(room_id: str, room: RoomUpdate):
             handle_db_exception(err)
 
 
-# =============================================================================
-# RESORT MODULE: SPORTS COURTS CRUD
-# =============================================================================
+# --- COURTS CRUD ---
 @app.get("/courts", response_model=List[CourtResponse], tags=["Courts"])
 async def get_courts():
     async with acquire_db_connection() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate
-            FROM resort.court
-            ORDER BY court_id
-            """
-        )
+        rows = await conn.fetch("SELECT court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate FROM resort.court ORDER BY court_id")
         return [dict(r) for r in rows]
 
 
 @app.get("/courts/calculate-price", tags=["Courts"])
 def calculate_court_price(
     court_type: Literal["Pickleball", "Basketball"],
-    start_time: time = Query(..., description="Start time e.g. 08:00"),
-    end_time: time = Query(..., description="End time e.g. 10:00"),
+    start_time: time = Query(...),
+    end_time: time = Query(...),
     paddle_count: int = Query(default=0, ge=0),
 ):
     if start_time >= end_time:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="start_time must be earlier than end_time.",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start_time must be earlier than end_time.")
 
     day_rate = Decimal("400.00") if court_type == "Pickleball" else Decimal("500.00")
     night_rate = Decimal("600.00") if court_type == "Pickleball" else Decimal("750.00")
@@ -990,7 +1146,7 @@ def calculate_court_price(
 @app.get("/courts/{court_id}/availability", tags=["Courts"])
 async def get_court_availability(
     court_id: str,
-    booking_date: date = Query(default_factory=lambda: datetime.now(PH_TZ).date(), description="Booking date (YYYY-MM-DD)"),
+    booking_date: date = Query(default_factory=lambda: datetime.now(PH_TZ).date()),
 ):
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
@@ -1017,13 +1173,7 @@ async def get_court_availability(
         }
 
 
-@app.post(
-    "/courts",
-    status_code=status.HTTP_201_CREATED,
-    response_model=CourtResponse,
-    tags=["Courts"],
-    dependencies=[Depends(verify_staff_token)],
-)
+@app.post("/courts", status_code=status.HTTP_201_CREATED, response_model=CourtResponse, tags=["Courts"], dependencies=[Depends(verify_staff_token)])
 async def create_court(court: CourtCreate):
     async with acquire_db_connection() as conn:
         try:
@@ -1045,9 +1195,7 @@ async def create_court(court: CourtCreate):
             handle_db_exception(err)
 
 
-# =============================================================================
-# RESORT MODULE: RESERVATIONS & BOOKINGS CRUD
-# =============================================================================
+# --- BOOKINGS CRUD ---
 @app.get("/bookings", response_model=List[BookingResponse], tags=["Bookings"])
 async def get_bookings(status_filter: Optional[str] = Query(default=None, alias="status")):
     base_query = """
@@ -1133,12 +1281,7 @@ async def get_booking(booking_id: str):
         return item
 
 
-@app.post(
-    "/bookings",
-    status_code=status.HTTP_201_CREATED,
-    response_model=BookingResponse,
-    tags=["Bookings"],
-)
+@app.post("/bookings", status_code=status.HTTP_201_CREATED, response_model=BookingResponse, tags=["Bookings"])
 async def create_booking(booking: BookingCreate):
     async with acquire_db_connection() as conn:
         async with conn.transaction():
@@ -1160,7 +1303,6 @@ async def create_booking(booking: BookingCreate):
                         detail="Booking Failure: Cannot reserve time slots that have already passed for today!",
                     )
 
-                # Resolve Staff ID safely (fits VARCHAR(10))
                 staff_id_val = booking.staff_id.strip()[:10] if booking.staff_id and booking.staff_id.strip() else None
                 if staff_id_val:
                     await conn.execute(
@@ -1172,44 +1314,33 @@ async def create_booking(booking: BookingCreate):
                         staff_id_val,
                     )
 
-                # Resolve Customer ID and Email safely (fits VARCHAR(10))
+                # Strictly verify that the customer exists in resort.customer (DO NOT auto-create fake accounts)
                 raw_cust = booking.customer_id.strip()
-                raw_email = (
-                    booking.customer_email.strip().lower()
-                    if booking.customer_email and booking.customer_email.strip()
-                    else (raw_cust.lower() if "@" in raw_cust else f"{raw_cust.lower()}@casavista.com")
-                )
+                raw_email = booking.customer_email.strip().lower() if booking.customer_email and booking.customer_email.strip() else ""
 
                 existing_cust = await conn.fetchrow(
                     """
                     SELECT customer_id, email
                     FROM resort.customer
-                    WHERE customer_id = $1 OR LOWER(email) = LOWER($2)
+                    WHERE customer_id = $1
+                       OR ($2 <> '' AND LOWER(email) = LOWER($2))
                     LIMIT 1
                     """,
-                    raw_cust[:10],
+                    raw_cust,
                     raw_email,
                 )
 
-                if existing_cust:
-                    resolved_customer_id = existing_cust["customer_id"]
-                    resolved_customer_email = existing_cust["email"] or raw_email
-                else:
-                    resolved_customer_id = raw_cust if (len(raw_cust) <= 10 and "@" not in raw_cust) else generate_short_customer_id(raw_email)
-                    resolved_customer_email = raw_email
-                    await conn.execute(
-                        """
-                        INSERT INTO resort.customer (customer_id, first_name, last_name, email, phone, address, customer_type)
-                        VALUES ($1, 'Registered', 'Customer', $2, '09123456789', 'Cebu City', 'Registered')
-                        ON CONFLICT (customer_id) DO NOTHING
-                        """,
-                        resolved_customer_id,
-                        resolved_customer_email,
+                if not existing_cust:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="ERR-401-UNREGISTERED: Only registered customer accounts can create bookings. Please log in with a valid account.",
                     )
+
+                resolved_customer_id = existing_cust["customer_id"]
+                resolved_customer_email = existing_cust["email"]
 
                 is_room_booking = booking.check_in_date is not None and booking.check_out_date is not None
 
-                # Enforce chk_booking_shape constraint at database level
                 court_id_val = None if is_room_booking else (booking.court_id.strip()[:10] if booking.court_id and booking.court_id.strip() else None)
                 start_time_val = None if is_room_booking else booking.start_time
                 end_time_val = None if is_room_booking else booking.end_time
@@ -1246,7 +1377,6 @@ async def create_booking(booking: BookingCreate):
                     c_night_rate = Decimal("750.00") if is_basketball else Decimal("600.00")
                     c_paddle_rate = Decimal("0.00") if is_basketball else Decimal("100.00")
 
-                    # Separate parameters ($1..$6) avoid asyncpg AmbiguousParameterError
                     await conn.execute(
                         """
                         INSERT INTO resort.court (court_id, court_name, court_type, rate_daytime, rate_nighttime, paddle_rate)
@@ -1261,7 +1391,6 @@ async def create_booking(booking: BookingCreate):
                         c_paddle_rate,
                     )
 
-                    # Check for overlapping active court bookings on the same court, date, and time window
                     collision = await conn.fetchrow(
                         """
                         SELECT booking_id
@@ -1377,32 +1506,19 @@ async def update_booking_status(
             handle_db_exception(err)
 
 
-# =============================================================================
-# RESORT MODULE: PAYMENT PROCESSING
-# =============================================================================
-@app.post(
-    "/payments",
-    status_code=status.HTTP_201_CREATED,
-    response_model=PaymentResponse,
-    tags=["Payments"],
-)
+# --- PAYMENTS ---
+@app.post("/payments", status_code=status.HTTP_201_CREATED, response_model=PaymentResponse, tags=["Payments"])
 async def process_payment(payment: PaymentCreate):
     async with acquire_db_connection() as conn:
         async with conn.transaction():
             try:
                 if payment.payment_type == "Refund" and payment.booking_id:
                     booking = await conn.fetchrow(
-                        """
-                        SELECT check_in_date, start_time FROM resort.booking
-                        WHERE booking_id = $1
-                        """,
+                        "SELECT check_in_date, start_time FROM resort.booking WHERE booking_id = $1",
                         payment.booking_id,
                     )
                     if not booking:
-                        raise HTTPException(
-                            status_code=status.HTTP_404_NOT_FOUND,
-                            detail="Target booking for refund not found.",
-                        )
+                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target booking for refund not found.")
 
                     sched_date = booking["check_in_date"] or datetime.now(PH_TZ).date()
                     sched_time = booking["start_time"] or time(14, 0)
@@ -1430,11 +1546,7 @@ async def process_payment(payment: PaymentCreate):
 
                 if payment.booking_id and payment.booking_id.strip() and payment.payment_type == "Payment":
                     await conn.execute(
-                        """
-                        UPDATE resort.booking
-                        SET status = 'Confirmed'
-                        WHERE booking_id = $1 AND status = 'Pending'
-                        """,
+                        "UPDATE resort.booking SET status = 'Confirmed' WHERE booking_id = $1 AND status = 'Pending'",
                         payment.booking_id,
                     )
 
@@ -1445,38 +1557,20 @@ async def process_payment(payment: PaymentCreate):
                 handle_db_exception(err)
 
 
-# =============================================================================
-# POS MODULE: CATALOG & ORDERS
-# =============================================================================
+# --- POS MODULE ---
 @app.get("/pos/items", response_model=List[POSItemResponse], tags=["POS Catalog"])
 async def get_pos_items():
     async with acquire_db_connection() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT item_id, name, category, price
-            FROM pos.pos_item
-            ORDER BY item_id
-            """
-        )
+        rows = await conn.fetch("SELECT item_id, name, category, price FROM pos.pos_item ORDER BY item_id")
         return [dict(r) for r in rows]
 
 
-@app.post(
-    "/pos/items",
-    status_code=status.HTTP_201_CREATED,
-    response_model=POSItemResponse,
-    tags=["POS Catalog"],
-    dependencies=[Depends(verify_staff_token)],
-)
+@app.post("/pos/items", status_code=status.HTTP_201_CREATED, response_model=POSItemResponse, tags=["POS Catalog"], dependencies=[Depends(verify_staff_token)])
 async def create_pos_item(item: POSItemCreate):
     async with acquire_db_connection() as conn:
         try:
             row = await conn.fetchrow(
-                """
-                INSERT INTO pos.pos_item (item_id, name, category, price)
-                VALUES ($1, $2, $3, $4)
-                RETURNING item_id, name, category, price
-                """,
+                "INSERT INTO pos.pos_item (item_id, name, category, price) VALUES ($1, $2, $3, $4) RETURNING item_id, name, category, price",
                 item.item_id,
                 item.name,
                 item.category,
@@ -1487,12 +1581,7 @@ async def create_pos_item(item: POSItemCreate):
             handle_db_exception(err)
 
 
-@app.post(
-    "/pos/orders",
-    status_code=status.HTTP_201_CREATED,
-    response_model=POSOrderResponse,
-    tags=["POS Orders"],
-)
+@app.post("/pos/orders", status_code=status.HTTP_201_CREATED, response_model=POSOrderResponse, tags=["POS Orders"])
 async def create_pos_order(order: POSOrderCreate):
     async with acquire_db_connection() as conn:
         async with conn.transaction():
@@ -1506,10 +1595,7 @@ async def create_pos_order(order: POSOrderCreate):
 
                 missing = set(item_ids) - set(price_map.keys())
                 if missing:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail=f"POS Items not found: {', '.join(missing)}",
-                    )
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"POS Items not found: {', '.join(missing)}")
 
                 total_amount = Decimal("0.00")
                 line_items_data = []
@@ -1550,7 +1636,6 @@ async def create_pos_order(order: POSOrderCreate):
                 res = dict(order_row)
                 res["items"] = inserted_items
                 return res
-
             except HTTPException:
                 raise
             except Exception as err:
@@ -1561,52 +1646,31 @@ async def create_pos_order(order: POSOrderCreate):
 async def get_pos_order(order_id: str):
     async with acquire_db_connection() as conn:
         order_row = await conn.fetchrow(
-            """
-            SELECT order_id, customer_id, staff_id, booking_id, order_date, total_amount
-            FROM pos.pos_order
-            WHERE order_id = $1
-            """,
+            "SELECT order_id, customer_id, staff_id, booking_id, order_date, total_amount FROM pos.pos_order WHERE order_id = $1",
             order_id,
         )
         if order_row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="POS Order not found.")
 
         item_rows = await conn.fetch(
-            """
-            SELECT order_id, item_id, quantity, subtotal
-            FROM pos.pos_order_item
-            WHERE order_id = $1
-            ORDER BY item_id
-            """,
+            "SELECT order_id, item_id, quantity, subtotal FROM pos.pos_order_item WHERE order_id = $1 ORDER BY item_id",
             order_id,
         )
-
         res = dict(order_row)
         res["items"] = [dict(r) for r in item_rows]
         return res
 
 
-# =============================================================================
-# RELATIONAL REPORTS & AUDIT QUERIES
-# =============================================================================
+# --- REPORTS ---
 @app.get("/reports/active-bookings-detail", tags=["Relational Reports"])
 async def report_active_bookings():
     query = """
         SELECT 
-            b.booking_id,
-            b.status AS booking_status,
-            b.booking_date,
-            c.customer_id,
-            c.first_name || ' ' || c.last_name AS customer_full_name,
-            c.phone AS customer_phone,
+            b.booking_id, b.status AS booking_status, b.booking_date,
+            c.customer_id, c.first_name || ' ' || c.last_name AS customer_full_name, c.phone AS customer_phone,
             COALESCE(s.first_name || ' ' || s.last_name, 'Unassigned') AS handler_staff_name,
-            r.room_number,
-            r.rate_per_day,
-            ct.court_name,
-            ct.court_type,
-            b.paddle_count,
-            b.created_at,
-            b.hold_expires_at
+            r.room_number, r.rate_per_day, ct.court_name, ct.court_type,
+            b.paddle_count, b.created_at, b.hold_expires_at
         FROM resort.booking b
         INNER JOIN resort.customer c ON b.customer_id = c.customer_id
         LEFT JOIN resort.staff s ON b.staff_id = s.staff_id
@@ -1624,14 +1688,8 @@ async def report_active_bookings():
 async def report_room_occupancy():
     query = """
         SELECT 
-            r.room_id,
-            r.room_number,
-            r.status AS housekeeping_status,
-            r.rate_per_day,
-            b.booking_id,
-            b.status AS booking_status,
-            b.check_in_date,
-            b.check_out_date,
+            r.room_id, r.room_number, r.status AS housekeeping_status, r.rate_per_day,
+            b.booking_id, b.status AS booking_status, b.check_in_date, b.check_out_date,
             c.first_name || ' ' || c.last_name AS current_guest_name
         FROM resort.room r
         LEFT JOIN resort.booking_room br ON r.room_id = br.room_id AND br.is_active
@@ -1648,14 +1706,8 @@ async def report_room_occupancy():
 async def report_pos_sales():
     query = """
         SELECT 
-            o.order_id,
-            o.order_date,
-            i.item_id,
-            i.name AS product_name,
-            i.category,
-            poi.quantity,
-            poi.subtotal AS line_subtotal,
-            o.total_amount AS order_total,
+            o.order_id, o.order_date, i.item_id, i.name AS product_name, i.category,
+            poi.quantity, poi.subtotal AS line_subtotal, o.total_amount AS order_total,
             s.first_name || ' ' || s.last_name AS cashier_staff_name,
             COALESCE(c.first_name || ' ' || c.last_name, 'Walk-In Customer') AS customer_name
         FROM pos.pos_order o
@@ -1674,19 +1726,9 @@ async def report_pos_sales():
 async def report_financial_payments():
     query = """
         SELECT 
-            p.payment_id,
-            p.amount,
-            p.method,
-            p.payment_type,
-            p.paid_at,
-            CASE 
-                WHEN p.booking_id IS NOT NULL THEN 'Accommodation/Court Booking'
-                ELSE 'POS Counter Sale'
-            END AS transaction_channel,
-            p.booking_id,
-            b.status AS booking_status,
-            p.order_id,
-            o.total_amount AS order_registered_total
+            p.payment_id, p.amount, p.method, p.payment_type, p.paid_at,
+            CASE WHEN p.booking_id IS NOT NULL THEN 'Accommodation/Court Booking' ELSE 'POS Counter Sale' END AS transaction_channel,
+            p.booking_id, b.status AS booking_status, p.order_id, o.total_amount AS order_registered_total
         FROM resort.payment p
         LEFT JOIN resort.booking b ON p.booking_id = b.booking_id
         LEFT JOIN pos.pos_order o ON p.order_id = o.order_id
@@ -1697,46 +1739,18 @@ async def report_financial_payments():
         return [dict(r) for r in rows]
 
 
-# =============================================================================
-# ADMIN P&L / REVENUE ANALYTICS
-# =============================================================================
-@app.get(
-    "/reports/revenue-pnl",
-    tags=["Admin Financial Reports"],
-    dependencies=[Depends(verify_staff_token)],
-)
+@app.get("/reports/revenue-pnl", tags=["Admin Financial Reports"], dependencies=[Depends(verify_staff_token)])
 async def get_revenue_pnl_summary(
-    start_date: Optional[date] = Query(default=None, description="Filter from date (YYYY-MM-DD)"),
-    end_date: Optional[date] = Query(default=None, description="Filter to date (YYYY-MM-DD)"),
+    start_date: Optional[date] = Query(default=None),
+    end_date: Optional[date] = Query(default=None),
 ):
     query = """
         SELECT 
-            COALESCE(SUM(CASE 
-                WHEN p.booking_id IS NOT NULL AND p.payment_type = 'Payment' THEN p.amount 
-                ELSE 0 
-            END), 0) AS gross_booking_revenue,
-
-            COALESCE(SUM(CASE 
-                WHEN p.order_id IS NOT NULL AND p.payment_type = 'Payment' THEN p.amount 
-                ELSE 0 
-            END), 0) AS gross_pos_revenue,
-
-            COALESCE(SUM(CASE 
-                WHEN p.payment_type = 'Refund' THEN p.amount 
-                ELSE 0 
-            END), 0) AS total_refunds,
-
-            COALESCE(SUM(CASE 
-                WHEN p.payment_type = 'Payment' THEN p.amount 
-                ELSE 0 
-            END), 0) AS total_gross_revenue,
-
-            COALESCE(SUM(CASE 
-                WHEN p.payment_type = 'Payment' THEN p.amount 
-                WHEN p.payment_type = 'Refund' THEN -p.amount 
-                ELSE 0 
-            END), 0) AS net_revenue,
-
+            COALESCE(SUM(CASE WHEN p.booking_id IS NOT NULL AND p.payment_type = 'Payment' THEN p.amount ELSE 0 END), 0) AS gross_booking_revenue,
+            COALESCE(SUM(CASE WHEN p.order_id IS NOT NULL AND p.payment_type = 'Payment' THEN p.amount ELSE 0 END), 0) AS gross_pos_revenue,
+            COALESCE(SUM(CASE WHEN p.payment_type = 'Refund' THEN p.amount ELSE 0 END), 0) AS total_refunds,
+            COALESCE(SUM(CASE WHEN p.payment_type = 'Payment' THEN p.amount ELSE 0 END), 0) AS total_gross_revenue,
+            COALESCE(SUM(CASE WHEN p.payment_type = 'Payment' THEN p.amount WHEN p.payment_type = 'Refund' THEN -p.amount ELSE 0 END), 0) AS net_revenue,
             COUNT(p.payment_id) AS total_transactions_count
         FROM resort.payment p
         WHERE ($1::date IS NULL OR p.paid_at::date >= $1)
@@ -1745,10 +1759,7 @@ async def get_revenue_pnl_summary(
     async with acquire_db_connection() as conn:
         row = await conn.fetchrow(query, start_date, end_date)
         return {
-            "period": {
-                "start_date": start_date or "All-Time",
-                "end_date": end_date or "All-Time",
-            },
+            "period": {"start_date": start_date or "All-Time", "end_date": end_date or "All-Time"},
             "financial_breakdown": {
                 "gross_booking_revenue": row["gross_booking_revenue"],
                 "gross_pos_revenue": row["gross_pos_revenue"],
