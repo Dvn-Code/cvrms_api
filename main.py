@@ -139,12 +139,17 @@ async def lifespan(app: FastAPI):
 
 docs_security = HTTPBasic(auto_error=True)
 
-ADMIN_USER = os.getenv("ADMIN_USERNAME", "cvrms_prd_service_account")
-ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "@Guest12345")
-STAFF_SECRET = os.getenv("STAFF_API_TOKEN", "CVRMS-SECURE-STAFF-TOKEN-2026")
+ADMIN_USER = os.getenv("ADMIN_USERNAME")
+ADMIN_PASS = os.getenv("ADMIN_PASSWORD")
+STAFF_SECRET = os.getenv("STAFF_API_TOKEN")
 
 
 def verify_swagger_credentials(credentials: HTTPBasicCredentials = Depends(docs_security)):
+    if not ADMIN_USER or not ADMIN_PASS:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server authentication environment variables are not configured.",
+        )
     is_user_valid = secrets.compare_digest(credentials.username, ADMIN_USER)
     is_pass_valid = secrets.compare_digest(credentials.password, ADMIN_PASS)
     if not (is_user_valid and is_pass_valid):
@@ -160,11 +165,11 @@ async def verify_staff_token(
     request: Request,
     x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
 ):
-    if x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
+    if STAFF_SECRET and x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
         return x_staff_token
 
     auth_header = request.headers.get("authorization")
-    if auth_header and auth_header.startswith("Basic "):
+    if auth_header and auth_header.startswith("Basic ") and ADMIN_USER and ADMIN_PASS:
         try:
             encoded = auth_header.split(" ", 1)[1].strip()
             decoded = base64.b64decode(encoded).decode("utf-8")
@@ -177,6 +182,55 @@ async def verify_staff_token(
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Unauthorized: Admin credentials or valid X-Staff-Token required.",
+        headers={"WWW-Authenticate": 'Basic realm="CVRMS Protected API"'},
+    )
+
+async def verify_customer_or_staff(
+    request: Request,
+    x_staff_token: Optional[str] = Header(default=None, alias="X-Staff-Token"),
+    x_customer_id: Optional[str] = Header(default=None, alias="X-Customer-Id"),
+) -> dict:
+    # 1. Check Staff Token
+    if STAFF_SECRET and x_staff_token and secrets.compare_digest(x_staff_token, STAFF_SECRET):
+        return {"role": "staff", "actor_id": "STAFF"}
+
+    # 2. Check HTTP Basic Auth (Admin or Registered Customer)
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.startswith("Basic "):
+        try:
+            encoded = auth_header.split(" ", 1)[1].strip()
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            user, pwd = decoded.split(":", 1)
+            if ADMIN_USER and ADMIN_PASS and secrets.compare_digest(user, ADMIN_USER) and secrets.compare_digest(pwd, ADMIN_PASS):
+                return {"role": "staff", "actor_id": user}
+
+            async with acquire_db_connection() as conn:
+                rows = await conn.fetch("SELECT customer_id, email, address FROM resort.customer")
+                for r in rows:
+                    _, c_username, stored_hash, _, _ = unpack_address_and_auth(r["address"])
+                    if (
+                        (r["email"] and r["email"].lower() == user.lower())
+                        or (c_username and c_username.lower() == user.lower())
+                        or r["customer_id"].lower() == user.lower()
+                    ):
+                        if stored_hash and verify_password_compact(pwd, stored_hash):
+                            return {"role": "customer", "actor_id": r["customer_id"]}
+        except Exception:
+            pass
+
+    # 3. Check X-Customer-Id Header from logged-in mobile client
+    if x_customer_id and x_customer_id.strip():
+        async with acquire_db_connection() as conn:
+            cust = await conn.fetchrow(
+                "SELECT customer_id FROM resort.customer WHERE customer_id = $1 OR LOWER(email) = LOWER($1)",
+                x_customer_id.strip(),
+            )
+            if cust:
+                return {"role": "customer", "actor_id": cust["customer_id"]}
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required: Provide Basic Auth credentials, X-Staff-Token, or valid X-Customer-Id.",
         headers={"WWW-Authenticate": 'Basic realm="CVRMS Protected API"'},
     )
 
@@ -467,8 +521,9 @@ class PaymentCreate(BaseModel):
     booking_id: Optional[str] = Field(default=None, max_length=15)
     order_id: Optional[str] = Field(default=None, max_length=15)
     amount: Decimal = Field(gt=Decimal("0.00"), decimal_places=2)
-    method: Literal["Cash", "Card", "GCash", "Maya", "Online Gateway"]
+    method: Literal["Cash", "Maya"]
     payment_type: Literal["Payment", "Refund"] = "Payment"
+    reference_no: Optional[str] = Field(default=None, min_length=3, max_length=50, examples=["MAYA-20261110-001"])
 
     @model_validator(mode="after")
     def validate_exclusive_payment_arc(self) -> PaymentCreate:
@@ -476,6 +531,8 @@ class PaymentCreate(BaseModel):
         has_order = self.order_id is not None and self.order_id.strip() != ""
         if not (has_booking ^ has_order):
             raise ValueError("A payment must link to either a Booking OR a POS Order, never both and never neither.")
+        if self.method == "Maya" and (not self.reference_no or not self.reference_no.strip()):
+            raise ValueError("Maya cashless payments require a valid transaction reference_no.")
         return self
 
 
@@ -486,6 +543,7 @@ class PaymentResponse(BaseModel):
     amount: Decimal
     method: str
     payment_type: str
+    reference_no: Optional[str] = None
     paid_at: datetime
 
 
@@ -648,13 +706,22 @@ async def send_verification_code(req: SendVerificationCodeRequest):
                 server.send_message(msg)
             email_sent = True
         except Exception as err:
-            print(f"Notice: SMTP dispatch failed ({err}). Dev code: {otp_code}")
+            print(f"Notice: SMTP dispatch failed ({err}).")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Failed to dispatch verification email. Please verify SMTP configuration.",
+            )
+
+    if not email_sent:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Email service is not configured on the server.",
+        )
 
     return {
         "status": "success",
-        "message": "Verification code sent to email." if email_sent else f"Verification code generated ([DEV OTP]: {otp_code}).",
+        "message": "Verification code sent to email.",
         "email": email_clean,
-        "dev_otp": otp_code,
     }
 
 
@@ -821,7 +888,8 @@ async def login_customer_account(req: CustomerLoginRequest):
 
 
 # --- CUSTOMERS CRUD ---
-@app.get("/customers", response_model=List[CustomerResponse], tags=["Customers"])
+# --- CUSTOMERS CRUD ---
+@app.get("/customers", response_model=List[CustomerResponse], tags=["Customers"], dependencies=[Depends(verify_staff_token)])
 async def get_customers():
     async with acquire_db_connection() as conn:
         rows = await conn.fetch(
@@ -835,7 +903,12 @@ async def get_customers():
 
 
 @app.get("/customers/{customer_id}", response_model=CustomerResponse, tags=["Customers"])
-async def get_customer(customer_id: str):
+async def get_customer(customer_id: str, auth_actor: dict = Depends(verify_customer_or_staff)):
+    if auth_actor["role"] == "customer" and auth_actor["actor_id"].lower() != customer_id.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Customers may only view their own profile record.",
+        )
     async with acquire_db_connection() as conn:
         row = await conn.fetchrow(
             """
@@ -1058,7 +1131,7 @@ async def get_staff_members():
         return [dict(r) for r in rows]
 
 
-@app.post("/staff", status_code=status.HTTP_201_CREATED, response_model=StaffResponse, tags=["Staff"])
+@app.post("/staff", status_code=status.HTTP_201_CREATED, response_model=StaffResponse, tags=["Staff"], dependencies=[Depends(verify_staff_token)])
 async def create_staff(staff: StaffCreate):
     async with acquire_db_connection() as conn:
         try:
@@ -1169,6 +1242,10 @@ def calculate_court_price(
 ):
     if start_time >= end_time:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start_time must be earlier than end_time.")
+    if start_time < time(6, 0) or end_time > time(22, 0):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Sports courts operate strictly between 06:00 AM and 10:00 PM.")
+    if paddle_count > 4:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Maximum of 4 pickleball paddles allowed per court booking.")
 
     day_rate = Decimal("400.00") if court_type == "Pickleball" else Decimal("500.00")
     night_rate = Decimal("600.00") if court_type == "Pickleball" else Decimal("750.00")
@@ -1444,7 +1521,48 @@ async def create_booking(booking: BookingCreate):
                         c_night_rate,
                         c_paddle_rate,
                     )
+                if start_time_val < time(6, 0) or end_time_val > time(22, 0):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Court Operating Hours Violation: Courts are only open from 06:00 AM to 10:00 PM.",
+                        )
 
+                    exclusive_block = await conn.fetchrow(
+                        """
+                        SELECT booking_id FROM resort.booking
+                        WHERE exclusive = TRUE
+                          AND status IN ('Confirmed', 'Checked-In', 'Pending')
+                          AND (status <> 'Pending' OR hold_expires_at > CURRENT_TIMESTAMP)
+                          AND check_in_date <= $1 AND check_out_date > $1
+                        LIMIT 1
+                        """,
+                        booking.booking_date,
+                    )
+                    if exclusive_block:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="ERR-409-EXCLUSIVE-BLOCK: Court booking blocked because an Exclusive Whole-Resort Buyout is active on this date.",
+                        )
+
+                    if paddle_count_val > 0:
+                        paddle_row = await conn.fetchrow(
+                            """
+                            SELECT COALESCE(SUM(paddle_count), 0) AS used_paddles
+                            FROM resort.booking
+                            WHERE booking_date = $1
+                              AND status IN ('Confirmed', 'Checked-In', 'Pending')
+                              AND (status <> 'Pending' OR hold_expires_at > CURRENT_TIMESTAMP)
+                              AND start_time < $3 AND end_time > $2
+                            """,
+                            booking.booking_date,
+                            start_time_val,
+                            end_time_val,
+                        )
+                        if (paddle_row["used_paddles"] + paddle_count_val) > 16:
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail="ERR-409-PADDLE-STOCK: Requested paddles exceed the resort's 16-paddle inventory for this time slot.",
+                            )
                     collision = await conn.fetchrow(
                         """
                         SELECT booking_id
@@ -1527,9 +1645,23 @@ async def create_booking(booking: BookingCreate):
 async def update_booking_status(
     booking_id: str,
     new_status: Literal["Pending", "Confirmed", "Checked-In", "Completed", "Cancelled"] = Query(..., alias="new_status"),
+    auth_actor: dict = Depends(verify_customer_or_staff),
 ):
     async with acquire_db_connection() as conn:
         try:
+            existing = await conn.fetchrow(
+                "SELECT booking_id, customer_id, status FROM resort.booking WHERE booking_id = $1",
+                booking_id,
+            )
+            if existing is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
+
+            if auth_actor["role"] == "customer":
+                if existing["customer_id"].lower() != auth_actor["actor_id"].lower():
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only modify your own bookings.")
+                if new_status != "Cancelled":
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Customers may only cancel bookings; confirmation requires payment.")
+
             row = await conn.fetchrow(
                 """
                 UPDATE resort.booking
@@ -1542,8 +1674,6 @@ async def update_booking_status(
                 new_status,
                 booking_id,
             )
-            if row is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
 
             cust_row = await conn.fetchrow("SELECT email FROM resort.customer WHERE customer_id = $1", row["customer_id"])
             room_rows = await conn.fetch("SELECT room_id FROM resort.booking_room WHERE booking_id = $1", booking_id)
@@ -1562,46 +1692,89 @@ async def update_booking_status(
 
 # --- PAYMENTS ---
 @app.post("/payments", status_code=status.HTTP_201_CREATED, response_model=PaymentResponse, tags=["Payments"])
-async def process_payment(payment: PaymentCreate):
+async def process_payment(
+    payment: PaymentCreate,
+    auth_actor: dict = Depends(verify_customer_or_staff),
+):
     async with acquire_db_connection() as conn:
         async with conn.transaction():
             try:
-                if payment.payment_type == "Refund" and payment.booking_id:
+                ref_clean = payment.reference_no.strip() if payment.reference_no and payment.reference_no.strip() else None
+
+                # Check duplicate reference_no ([WD3])
+                if ref_clean:
+                    dup_ref = await conn.fetchrow(
+                        "SELECT payment_id FROM resort.payment WHERE reference_no = $1 LIMIT 1",
+                        ref_clean,
+                    )
+                    if dup_ref:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"ERR-409-DUPLICATE-REF: Payment reference number '{ref_clean}' has already been used.",
+                        )
+
+                if payment.booking_id and payment.booking_id.strip():
                     booking = await conn.fetchrow(
-                        "SELECT check_in_date, start_time FROM resort.booking WHERE booking_id = $1",
-                        payment.booking_id,
+                        """
+                        SELECT booking_id, customer_id, status, check_in_date, start_time, hold_expires_at, total_amount
+                        FROM resort.booking
+                        WHERE booking_id = $1
+                        """,
+                        payment.booking_id.strip(),
                     )
                     if not booking:
-                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target booking for refund not found.")
+                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target booking not found.")
 
-                    sched_date = booking["check_in_date"] or datetime.now(PH_TZ).date()
-                    sched_time = booking["start_time"] or time(14, 0)
-                    sched_dt = datetime.combine(sched_date, sched_time)
+                    if auth_actor["role"] == "customer" and booking["customer_id"].lower() != auth_actor["actor_id"].lower():
+                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You may only submit payments for your own booking.")
 
-                    if (sched_dt - datetime.now(PH_TZ).replace(tzinfo=None)).total_seconds() < 86400:
-                        raise HTTPException(
-                            status_code=status.HTTP_400_BAD_REQUEST,
-                            detail="Cancellations requested within 24 hours of check-in are strictly non-refundable.",
-                        )
+                    if payment.payment_type == "Payment":
+                        if booking["status"] == "Confirmed":
+                            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Booking is already Confirmed.")
+                        # Allow 2-minute grace window after 15-min hold_expires_at ([WD13])
+                        if booking["hold_expires_at"] and datetime.now(timezone.utc) > (booking["hold_expires_at"] + timedelta(minutes=2)):
+                            await conn.execute("UPDATE resort.booking SET status = 'Cancelled' WHERE booking_id = $1", booking["booking_id"])
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Hold window has expired. Booking has been cancelled.",
+                            )
+
+                    elif payment.payment_type == "Refund":
+                        if auth_actor["role"] != "staff":
+                            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Refund disbursements require Staff or Admin authorization.")
+                        sched_date = booking["check_in_date"] or datetime.now(PH_TZ).date()
+                        sched_time = booking["start_time"] or time(14, 0)
+                        sched_dt = datetime.combine(sched_date, sched_time)
+                        if (sched_dt - datetime.now(PH_TZ).replace(tzinfo=None)).total_seconds() < 86400:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Cancellations requested within 24 hours of check-in are strictly non-refundable.",
+                            )
 
                 row = await conn.fetchrow(
                     """
-                    INSERT INTO resort.payment (payment_id, booking_id, order_id, amount, method, payment_type, paid_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
-                    RETURNING payment_id, booking_id, order_id, amount, method, payment_type, paid_at
+                    INSERT INTO resort.payment (payment_id, booking_id, order_id, amount, method, payment_type, reference_no, paid_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+                    RETURNING payment_id, booking_id, order_id, amount, method, payment_type, reference_no, paid_at
                     """,
                     payment.payment_id,
-                    payment.booking_id if payment.booking_id and payment.booking_id.strip() else None,
-                    payment.order_id if payment.order_id and payment.order_id.strip() else None,
+                    payment.booking_id.strip() if payment.booking_id and payment.booking_id.strip() else None,
+                    payment.order_id.strip() if payment.order_id and payment.order_id.strip() else None,
                     payment.amount,
                     payment.method,
                     payment.payment_type,
+                    ref_clean,
                 )
 
                 if payment.booking_id and payment.booking_id.strip() and payment.payment_type == "Payment":
                     await conn.execute(
                         "UPDATE resort.booking SET status = 'Confirmed' WHERE booking_id = $1 AND status = 'Pending'",
-                        payment.booking_id,
+                        payment.booking_id.strip(),
+                    )
+                elif payment.booking_id and payment.booking_id.strip() and payment.payment_type == "Refund":
+                    await conn.execute(
+                        "UPDATE resort.booking SET status = 'Cancelled' WHERE booking_id = $1",
+                        payment.booking_id.strip(),
                     )
 
                 return dict(row)
