@@ -1521,7 +1521,8 @@ async def create_booking(booking: BookingCreate):
                         c_night_rate,
                         c_paddle_rate,
                     )
-                if start_time_val < time(6, 0) or end_time_val > time(22, 0):
+
+                    if start_time_val < time(6, 0) or end_time_val > time(22, 0):
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Court Operating Hours Violation: Courts are only open from 06:00 AM to 10:00 PM.",
@@ -1563,6 +1564,7 @@ async def create_booking(booking: BookingCreate):
                                 status_code=status.HTTP_409_CONFLICT,
                                 detail="ERR-409-PADDLE-STOCK: Requested paddles exceed the resort's 16-paddle inventory for this time slot.",
                             )
+
                     collision = await conn.fetchrow(
                         """
                         SELECT booking_id
